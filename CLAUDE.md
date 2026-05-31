@@ -1,0 +1,60 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What is ainstype
+
+A macOS menubar app for speech-to-text. Hold a hotkey, speak, release — your words are transcribed fully locally using WhisperKit (CoreML on Apple Silicon) and pasted into the focused app. No cloud, no network calls beyond the one-time model download.
+
+## Commands
+
+```bash
+swift build                    # debug build
+swift run                      # run debug build
+swift build -c release         # release build
+./build_app.sh                 # build .app bundle + sign + DMG + notarize
+```
+
+There are no tests yet.
+
+## Architecture
+
+The pipeline flows: **hotkey → record → transcribe → dictionary replacements → clipboard/paste**.
+
+### Source files (`Sources/AinstypeApp/`)
+
+- `App.swift` — `@main` entry point, `NSApplicationDelegate`, sleep/wake handling.
+- `StatusMenuController.swift` — `NSStatusItem` menu bar UI, state machine (setup/downloading/loading/idle/recording/processing), first-run setup dialog, Start at Login toggle.
+- `HotkeyMonitor.swift` — `NSEvent.addGlobalMonitorForEvents(.flagsChanged)` for modifier key hotkeys. Requires Input Monitoring permission.
+- `AudioRecorder.swift` — `AVAudioEngine` capture, outputs 16kHz mono Float32 array.
+- `Pipeline.swift` — Orchestrates: WhisperKit transcribe → dictionary replacements → clipboard paste. Two-phase warmUp: fast GPU load (~5-10s), then background ANE specialization.
+- `ModelState.swift` — Persists downloaded model path and ANE specialization state to `~/.config/ainstype/model_state.json`.
+- `Dictionary.swift` — Reads `dictionary.toml`, builds Whisper initial prompt, applies spoken→written replacements.
+- `Clipboard.swift` — `NSPasteboard` + `CGEvent` Cmd+V paste (no osascript). Requires Accessibility permission.
+- `Config.swift` — TOMLKit-based config, reads `~/.config/ainstype/` files.
+- `LaunchAgent.swift` — Manages `~/Library/LaunchAgents/com.ainstype.menubar.plist` for auto-start at login.
+- `Logger.swift` — Writes to `os_log` and `~/Library/Logs/ainstype/app.log`.
+
+## Configuration
+
+Config dir: `~/.config/ainstype/`.
+
+Files:
+- `config.toml` — User overrides (hotkey, language)
+- `dictionary.toml` — Custom terms for Whisper biasing + spoken→written replacements
+- `model_state.json` — Cached WhisperKit model path and ANE specialization state
+
+## Build & Distribution
+
+The app is built and distributed as a signed/notarized `.app` bundle in a DMG.
+
+- Code signing identity: override via the `SIGN_IDENTITY` env var (e.g. `Developer ID Application: Your Name (TEAMID)`); team id via `TEAM_ID`. Defaults in `build_app.sh` are the maintainer's.
+- Notarization keychain profile: `ainstype-notary`
+- Build script: `build_app.sh` (prompts to bundle WhisperKit model; set `BUNDLE_MODEL=yes|no` to skip prompt)
+- WhisperKit model: `openai_whisper-large-v3-v20240930_turbo_632MB` (~616MB). Bundled in DMG or downloaded on first run.
+
+## Key conventions
+
+- Targets macOS 14+ (Sonoma), Apple Silicon only.
+- SPM dependencies: WhisperKit (0.12.0+), TOMLKit (0.6.0+).
+- Two-phase model loading: GPU-first for fast startup (~5-10s), then background ANE specialization for optimal inference.

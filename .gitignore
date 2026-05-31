@@ -1,0 +1,16 @@
+# Swift
+.build/
+.swiftpm/
+*.xcodeproj
+xcuserdata/
+DerivedData/
+
+# Build artifacts
+*.dmg
+dist/
+
+# macOS
+.DS_Store
+
+# Local tooling
+.claude/
