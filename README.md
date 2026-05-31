@@ -1,6 +1,10 @@
-# ainstype
+<p align="center">
+  <img src="icon.png" alt="ainstype" width="128" height="128">
+</p>
 
-A macOS menubar app for local speech-to-text. Hold a hotkey, speak, release — your transcription is pasted into the focused app.
+<h1 align="center">ainstype</h1>
+
+<p align="center">A macOS menubar app for local speech-to-text. Hold a hotkey, speak, release — your transcription is pasted into the focused app.</p>
 
 - Fully local transcription via [WhisperKit](https://github.com/argmaxinc/WhisperKit) (CoreML, Apple Silicon)
 - Custom dictionary for domain-specific terms
@@ -18,13 +22,22 @@ Everything runs on-device. Audio is transcribed locally with WhisperKit and neve
 
 ## Quick Start
 
+1. Download the latest **`ainstype-x.y.z.dmg`** from the [Releases page](https://github.com/ph1lb4/ainstype/releases/latest).
+2. Open the DMG and drag **ainstype** into your **Applications** folder.
+3. Launch ainstype from Applications — it runs in the menu bar (no dock icon).
+4. Grant **Input Monitoring** and **Accessibility** permissions when prompted.
+
+Hold **Right Cmd** and speak. Release to transcribe and paste.
+
+The DMG bundles the WhisperKit model, so there's no first-run download.
+
+## Build from source
+
 ```bash
 swift build && swift run
 ```
 
-On first launch, the app downloads the WhisperKit model (~616MB). Grant Input Monitoring and Accessibility permissions when prompted.
-
-Hold **Right Cmd** and speak. Release to transcribe and paste.
+On first launch, the app downloads the WhisperKit model (~616MB) unless one is already bundled.
 
 ## Build & Distribute
 
