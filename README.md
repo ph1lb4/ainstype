@@ -14,6 +14,15 @@
 
 Everything runs on-device. Audio is transcribed locally with WhisperKit and never leaves your Mac. The only network request the app makes is the one-time WhisperKit model download on first launch (or you can bundle the model so there's no download at all).
 
+## Model
+
+Transcription uses **`openai_whisper-large-v3-v20240930_turbo_632MB`** — a CoreML conversion of OpenAI's [Whisper large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) with compressed weights (about 600 MB), downloaded from Argmax's [whisperkit-coreml](https://huggingface.co/argmaxinc/whisperkit-coreml) Hugging Face repo and run via [WhisperKit](https://github.com/argmaxinc/WhisperKit).
+
+- Original Whisper source code: [openai/whisper](https://github.com/openai/whisper) (MIT)
+- Original model weights: [openai/whisper-large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo)
+- CoreML model used by the app: [argmaxinc/whisperkit-coreml](https://huggingface.co/argmaxinc/whisperkit-coreml)
+- Inference runtime: [argmaxinc/WhisperKit](https://github.com/argmaxinc/WhisperKit) (MIT)
+
 ## Requirements
 
 - macOS 14+ (Sonoma)
@@ -37,7 +46,7 @@ The DMG bundles the WhisperKit model, so there's no first-run download.
 swift build && swift run
 ```
 
-On first launch, the app downloads the WhisperKit model (~616MB) unless one is already bundled.
+On first launch, the app downloads the WhisperKit model (about 600 MB) unless one is already bundled.
 
 ## Build & Distribute
 
