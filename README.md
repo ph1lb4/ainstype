@@ -10,6 +10,17 @@
 - Custom dictionary for domain-specific terms
 - Runs in the menu bar, starts at login
 
+## Quick Start
+
+1. Download the latest **`ainstype-x.y.z.dmg`** from the [Releases page](https://github.com/ph1lb4/ainstype/releases/latest).
+2. Open the DMG and drag **ainstype** into your **Applications** folder.
+3. Launch ainstype from Applications — it runs in the menu bar (no dock icon).
+4. Grant **Input Monitoring** and **Accessibility** permissions when prompted.
+
+Hold **Right Cmd** and speak. Release to transcribe and paste.
+
+The DMG bundles the WhisperKit model, so there's no first-run download.
+
 ## Privacy
 
 Everything runs on-device. Audio is transcribed locally with WhisperKit and never leaves your Mac. The only network request the app makes is the one-time WhisperKit model download on first launch (or you can bundle the model so there's no download at all).
@@ -28,17 +39,6 @@ Transcription uses **`openai_whisper-large-v3-v20240930_turbo_632MB`** — a Cor
 - macOS 14+ (Sonoma)
 - Apple Silicon (M1/M2/M3/M4)
 - Xcode Command Line Tools (`xcode-select --install`)
-
-## Quick Start
-
-1. Download the latest **`ainstype-x.y.z.dmg`** from the [Releases page](https://github.com/ph1lb4/ainstype/releases/latest).
-2. Open the DMG and drag **ainstype** into your **Applications** folder.
-3. Launch ainstype from Applications — it runs in the menu bar (no dock icon).
-4. Grant **Input Monitoring** and **Accessibility** permissions when prompted.
-
-Hold **Right Cmd** and speak. Release to transcribe and paste.
-
-The DMG bundles the WhisperKit model, so there's no first-run download.
 
 ## Build from source
 
