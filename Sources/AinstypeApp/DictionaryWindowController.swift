@@ -4,6 +4,7 @@ import AppKit
 class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private var window: NSWindow?
     private let dictionary: DictionaryManager
+    private let history: TranscriptionHistory
 
     private var words: [String] = []
     private var names: [String] = []
@@ -13,13 +14,19 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     private var wordsTable: NSTableView!
     private var namesTable: NSTableView!
     private var replacementsTable: NSTableView!
+    private var tabView: NSTabView!
+    private var historyTextView: NSTextView!
 
-    init(dictionary: DictionaryManager) {
+    /// Index of the History tab, for `showWindow(selectTab:)`.
+    static let historyTabIndex = 3
+
+    init(dictionary: DictionaryManager, history: TranscriptionHistory) {
         self.dictionary = dictionary
+        self.history = history
         super.init()
     }
 
-    func showWindow() {
+    func showWindow(selectTab: Int? = nil) {
         if window == nil {
             buildWindow()
         }
@@ -27,8 +34,26 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         wordsTable.reloadData()
         namesTable.reloadData()
         replacementsTable.reloadData()
+        loadHistory()
+        if let selectTab {
+            tabView.selectTabViewItem(at: selectTab)
+        }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func loadHistory() {
+        let entries = history.recent()
+        guard !entries.isEmpty else {
+            historyTextView.string = "No transcriptions yet."
+            return
+        }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .medium
+        historyTextView.string = entries
+            .map { "[\(formatter.string(from: $0.date))]\n\($0.text)" }
+            .joined(separator: "\n\n\u{2014}\u{2014}\u{2014}\n\n")
     }
 
     private func loadData() {
@@ -73,6 +98,8 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         tabView.addTabViewItem(makeTab(title: "Words", tag: 0))
         tabView.addTabViewItem(makeTab(title: "Names", tag: 1))
         tabView.addTabViewItem(makeTab(title: "Replacements", tag: 2))
+        tabView.addTabViewItem(makeHistoryTab())
+        self.tabView = tabView
 
         w.contentView!.addSubview(tabView)
         NSLayoutConstraint.activate([
@@ -162,6 +189,59 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
 
         item.view = container
         return item
+    }
+
+    private func makeHistoryTab() -> NSTabViewItem {
+        let item = NSTabViewItem()
+        item.label = "History"
+
+        let container = NSView()
+
+        let scrollView = NSTextView.scrollableTextView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.borderType = .bezelBorder
+
+        let textView = scrollView.documentView as! NSTextView
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = .systemFont(ofSize: 12)
+        textView.textContainerInset = NSSize(width: 6, height: 6)
+        historyTextView = textView
+
+        let copyButton = NSButton(title: "Copy Latest", target: self, action: #selector(copyLatestHistory))
+        copyButton.translatesAutoresizingMaskIntoConstraints = false
+        copyButton.bezelStyle = .rounded
+
+        let hint = NSTextField(labelWithString: "Last 5 transcriptions. Select text to copy a portion.")
+        hint.font = .systemFont(ofSize: 10)
+        hint.textColor = .secondaryLabelColor
+        hint.translatesAutoresizingMaskIntoConstraints = false
+
+        container.addSubview(scrollView)
+        container.addSubview(copyButton)
+        container.addSubview(hint)
+
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            scrollView.bottomAnchor.constraint(equalTo: copyButton.topAnchor, constant: -8),
+
+            hint.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            hint.centerYAnchor.constraint(equalTo: copyButton.centerYAnchor),
+
+            copyButton.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            copyButton.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8),
+        ])
+
+        item.view = container
+        return item
+    }
+
+    @objc private func copyLatestHistory() {
+        guard let latest = history.recent().first else { return }
+        Clipboard.copy(latest.text)
     }
 
     // MARK: - Actions

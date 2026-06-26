@@ -6,8 +6,9 @@ import WhisperKit
 /// Orchestrates the full pipeline: transcribe → dictionary → paste.
 class Pipeline {
     private let config: Config
-    private let whisperKitBox = OSAllocatedUnfairLock<WhisperKit?>(initialState: nil)
+    fileprivate let whisperKitBox = OSAllocatedUnfairLock<WhisperKit?>(initialState: nil)
     let dictionary: DictionaryManager
+    let history = TranscriptionHistory()
 
     /// Whether a model is available (bundled in app or previously downloaded).
     var hasCachedModel: Bool {
@@ -178,6 +179,7 @@ class Pipeline {
 
         // Dictionary replacements
         let text = dictionary.applyReplacements(rawText)
+        history.add(text)
 
         // Paste to focused app
         log("Pasting result...")
@@ -192,6 +194,12 @@ class Pipeline {
         }
     }
 
+    /// Create a streaming session for live transcription, sharing this pipeline's
+    /// loaded WhisperKit instance and dictionary.
+    func makeLiveSession(config: Config) -> LiveSession {
+        LiveSession(pipeline: self, config: config)
+    }
+
     enum PipelineError: Error, LocalizedError {
         case modelNotReady
 
@@ -200,5 +208,85 @@ class Pipeline {
             case .modelNotReady: "Whisper model not loaded yet — still initializing"
             }
         }
+    }
+}
+
+/// Stateful streaming transcription for live mode.
+///
+/// Mirrors WhisperKit's `AudioStreamTranscriber` confirmation strategy: the
+/// growing audio buffer is re-transcribed periodically and split into
+/// "confirmed" segments (stable, older audio) and an "unconfirmed" tail that may
+/// still be revised. Only confirmed text is emitted while recording; the tail is
+/// emitted by `finish()` on release.
+final class LiveSession {
+    private let pipeline: Pipeline
+    private let config: Config
+    private let sampleRate: Float = 16000
+    /// Audio newer than this many seconds (from the end of the buffer) is left
+    /// unconfirmed, since Whisper may still revise the most recent words.
+    private let confirmationMargin: Float = 2.0
+
+    private var lastConfirmedEnd: Float = 0
+    private var hasEmitted = false
+    /// Full text emitted so far this session (confirmed chunks + final tail),
+    /// for recovery via the history window if pasting failed.
+    private(set) var transcript = ""
+
+    init(pipeline: Pipeline, config: Config) {
+        self.pipeline = pipeline
+        self.config = config
+    }
+
+    /// Transcribe the accumulated buffer and return newly-confirmed text
+    /// (dictionary replacements applied), or nil if nothing was newly confirmed.
+    func ingest(_ samples: [Float]) async throws -> String? {
+        guard let wk = pipeline.whisperKitBox.withLock({ $0 }) else { return nil }
+
+        // Confirm only audio older than the margin; need new confirmable audio first.
+        let totalSeconds = Float(samples.count) / sampleRate
+        let confirmBefore = totalSeconds - confirmationMargin
+        guard confirmBefore > lastConfirmedEnd else { return nil }
+
+        let segments = try await transcribe(samples, using: wk)
+        let newlyConfirmed = segments.filter { $0.end > lastConfirmedEnd && $0.end <= confirmBefore }
+        guard let last = newlyConfirmed.last else { return nil }
+        lastConfirmedEnd = last.end
+
+        return emit(newlyConfirmed.map { $0.text }.joined())
+    }
+
+    /// Final pass after recording stops: emit everything remaining after the last
+    /// confirmed point (the unconfirmed tail).
+    func finish(_ samples: [Float]) async throws -> String? {
+        guard let wk = pipeline.whisperKitBox.withLock({ $0 }) else { return nil }
+        let segments = try await transcribe(samples, using: wk)
+        let remaining = segments.filter { $0.end > lastConfirmedEnd }
+        guard !remaining.isEmpty else { return nil }
+        return emit(remaining.map { $0.text }.joined())
+    }
+
+    private func transcribe(_ samples: [Float], using wk: WhisperKit) async throws -> [TranscriptionSegment] {
+        var options = DecodingOptions(language: config.language, temperature: 0)
+        // Decode clean word text (no <|...|> special/timestamp tokens in segment text).
+        options.skipSpecialTokens = true
+        // Only decode audio after the last confirmed point; segment timestamps
+        // remain absolute from the start of `samples`.
+        options.clipTimestamps = [lastConfirmedEnd]
+        let results = try await wk.transcribe(audioArray: samples, decodeOptions: options)
+        return results.flatMap { $0.segments }
+    }
+
+    /// Apply dictionary replacements and strip the leading space Whisper puts on
+    /// the very first segment. Returns nil if the result is empty.
+    private func emit(_ raw: String) -> String? {
+        var text = raw
+        if !hasEmitted {
+            text = String(text.drop { $0 == " " })
+        }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        hasEmitted = true
+        let replaced = pipeline.dictionary.applyReplacements(text)
+        transcript += replaced
+        return replaced
     }
 }

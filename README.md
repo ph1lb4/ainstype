@@ -7,7 +7,9 @@
 <p align="center">A macOS menubar app for local speech-to-text. Hold a hotkey, speak, release — your transcription is pasted into the focused app.</p>
 
 - Fully local transcription via [WhisperKit](https://github.com/argmaxinc/WhisperKit) (CoreML, Apple Silicon)
+- Live transcription — text is pasted incrementally as you speak (on by default)
 - Custom dictionary for domain-specific terms
+- History of the last 5 transcriptions, to recover text if a paste didn't land
 - Runs in the menu bar, starts at login
 
 ## Quick Start
@@ -61,11 +63,16 @@ This builds a signed `.app` bundle and creates a DMG. Optionally bundles the Whi
 Edit `~/.config/ainstype/config.toml`:
 
 ```toml
-language = "en"          # optional, auto-detect if omitted
+language = "en"           # optional, auto-detect if omitted
+live_transcription = true # paste text incrementally while you speak (on by default; toggle from the menu)
 
 [recording]
 hotkey = "cmd_r"         # cmd, cmd_r, alt, alt_r, ctrl, ctrl_r
 ```
+
+**Live transcription** (on by default) pastes your words in chunks every couple of seconds as you keep talking, instead of all at once on release. Text appears with a ~2–4s lag (Whisper revises the most recent words as it hears more context), and only finalized text is pasted — so it never garbles or duplicates. Toggle it from the menu bar or via the config key above.
+
+The **History** tab (menu bar → Recent Transcriptions…, or the Dictionary window) keeps the last five transcriptions so you can copy text back if a paste didn't land in the focused app.
 
 Custom terms in `~/.config/ainstype/dictionary.toml`:
 

@@ -107,6 +107,16 @@ class AudioRecorder {
         Logger.log("AudioRecorder started")
     }
 
+    /// Snapshot of all audio captured so far, without stopping recording or
+    /// clearing the buffer. Used by live mode to transcribe the growing buffer
+    /// periodically; sample timestamps stay absolute from the start of recording.
+    func currentSamples() -> [Float] {
+        lock.lock()
+        let snapshot = frames
+        lock.unlock()
+        return snapshot.flatMap { $0 }
+    }
+
     /// Stop recording and return concatenated audio samples.
     func stop() -> [Float] {
         guard isRecording else { return [] }

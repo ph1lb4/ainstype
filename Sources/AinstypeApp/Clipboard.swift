@@ -48,6 +48,29 @@ enum Clipboard {
         return true
     }
 
+    /// Copy text and simulate Cmd+V, WITHOUT saving/restoring the clipboard.
+    /// Used by live mode where many chunks are pasted in sequence; the caller is
+    /// responsible for restoring the user's original clipboard once at the end.
+    static func pasteChunk(_ text: String) {
+        copy(text)
+
+        let source = CGEventSource(stateID: CGEventSourceStateID.hidSystemState)
+
+        // Key code 9 = V
+        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
+        else {
+            Logger.error("Failed to create CGEvent for paste chunk")
+            return
+        }
+
+        keyDown.flags = CGEventFlags.maskCommand
+        keyUp.flags = CGEventFlags.maskCommand
+
+        keyDown.post(tap: CGEventTapLocation.cghidEventTap)
+        keyUp.post(tap: CGEventTapLocation.cghidEventTap)
+    }
+
     /// Check if the app has Accessibility permission (needed for CGEvent paste).
     static func checkAccessibility() -> Bool {
         AXIsProcessTrusted()

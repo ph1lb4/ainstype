@@ -16,6 +16,9 @@ struct Config {
     var language: String? = nil
     var autoPaste: Bool = true
     var verbose: Bool = false
+    /// When true, paste confirmed text incrementally while recording (live mode)
+    /// instead of pasting everything once on hotkey release. On by default.
+    var liveTranscription: Bool = true
     var recording: RecordingConfig = RecordingConfig()
     var transcription: TranscriptionConfig = TranscriptionConfig()
 
@@ -61,6 +64,7 @@ struct Config {
         if let language = table["language"]?.string { self.language = language }
         if let autoPaste = table["auto_paste"]?.bool { self.autoPaste = autoPaste }
         if let verbose = table["verbose"]?.bool { self.verbose = verbose }
+        if let live = table["live_transcription"]?.bool { self.liveTranscription = live }
 
         if let rec = table["recording"]?.table {
             if let hotkey = rec["hotkey"]?.string { self.recording.hotkey = hotkey }
@@ -90,8 +94,17 @@ struct Config {
         return mapping[name] ?? name
     }
 
-    /// Save a single key-value pair to the user config file.
+    /// Save a single string key-value pair to the user config file.
     func saveUserConfig(key: String, value: String) {
+        setUserConfig(key: key, value: TOMLValue(stringLiteral: value))
+    }
+
+    /// Save a single boolean key-value pair to the user config file.
+    func saveUserConfig(key: String, value: Bool) {
+        setUserConfig(key: key, value: TOMLValue(booleanLiteral: value))
+    }
+
+    private func setUserConfig(key: String, value: any TOMLValueConvertible) {
         let configURL = Config.configDir.appendingPathComponent("config.toml")
         try? FileManager.default.createDirectory(at: Config.configDir, withIntermediateDirectories: true)
 
@@ -106,11 +119,11 @@ struct Config {
 
         let parts = key.split(separator: ".").map(String.init)
         if parts.count == 2 {
-            var section = table[parts[0]]?.table ?? TOMLTable()
-            section[parts[1]] = TOMLValue(stringLiteral: value)
+            let section = table[parts[0]]?.table ?? TOMLTable()
+            section[parts[1]] = value
             table[parts[0]] = section
         } else {
-            table[key] = TOMLValue(stringLiteral: value)
+            table[key] = value
         }
 
         try? table.convert().write(to: configURL, atomically: true, encoding: .utf8)

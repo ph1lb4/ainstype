@@ -18,6 +18,7 @@ class StatusMenuController {
     private var statusItem: NSStatusItem!
     private var statusMenuItem: NSMenuItem!
     private var startAtLoginItem: NSMenuItem!
+    private var liveTranscriptionItem: NSMenuItem!
     private var dictionaryWindowController: DictionaryWindowController?
     private var setupWindowController: SetupWindowController?
     private var hotkeyMonitor: HotkeyMonitor?
@@ -26,6 +27,11 @@ class StatusMenuController {
     private var currentState: State = .setup
     private var isRecording = false
     private let lock = NSLock()
+
+    // Live (streaming) transcription state
+    private var liveSession: LiveSession?
+    private var liveTask: Task<Void, Never>?
+    private var savedClipboard: String?
 
     init(config: Config, pipeline: Pipeline) {
         self.config = config
@@ -51,11 +57,22 @@ class StatusMenuController {
         dictItem.target = self
         menu.addItem(dictItem)
 
+        // Recent transcriptions (recover text if pasting failed)
+        let historyItem = NSMenuItem(title: "Recent Transcriptions\u{2026}", action: #selector(openHistory), keyEquivalent: "")
+        historyItem.target = self
+        menu.addItem(historyItem)
+
         // Start at Login
         startAtLoginItem = NSMenuItem(title: "Start at Login", action: #selector(toggleStartAtLogin), keyEquivalent: "")
         startAtLoginItem.target = self
         startAtLoginItem.state = LaunchAgent.isInstalled ? .on : .off
         menu.addItem(startAtLoginItem)
+
+        // Live transcription (paste incrementally while recording)
+        liveTranscriptionItem = NSMenuItem(title: "Live Transcription", action: #selector(toggleLiveTranscription), keyEquivalent: "")
+        liveTranscriptionItem.target = self
+        liveTranscriptionItem.state = config.liveTranscription ? .on : .off
+        menu.addItem(liveTranscriptionItem)
 
         // Permissions
         let permItem = NSMenuItem(title: "Check Permissions…", action: #selector(checkPermissions), keyEquivalent: "")
@@ -203,6 +220,9 @@ class StatusMenuController {
         do {
             try recorder.start()
             DispatchQueue.main.async { self.updateState(.recording) }
+            if config.liveTranscription {
+                startLiveLoop()
+            }
         } catch {
             Logger.error("Failed to start recording: \(error)")
             lock.lock()
@@ -216,6 +236,11 @@ class StatusMenuController {
         guard isRecording else { lock.unlock(); return }
         isRecording = false
         lock.unlock()
+
+        if config.liveTranscription, let session = liveSession {
+            finishLiveLoop(session)
+            return
+        }
 
         let audio = recorder.stop()
         DispatchQueue.main.async { self.updateState(.processing) }
@@ -231,6 +256,66 @@ class StatusMenuController {
             } catch {
                 Logger.error("Pipeline error: \(error)")
                 await showNotification(title: "ainstype Error", body: String(describing: error).prefix(200).description)
+            }
+            DispatchQueue.main.async { self.updateState(.idle) }
+        }
+    }
+
+    // MARK: - Live Transcription Loop
+
+    /// Periodically transcribe the growing buffer and paste newly-confirmed text.
+    private func startLiveLoop() {
+        savedClipboard = Clipboard.read()
+        let session = pipeline.makeLiveSession(config: config)
+        liveSession = session
+
+        liveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_500_000_000) // ~1.5s cadence
+                if Task.isCancelled { break }
+                guard let self else { break }
+                let samples = self.recorder.currentSamples()
+                guard !samples.isEmpty else { continue }
+                do {
+                    if let chunk = try await session.ingest(samples), !chunk.isEmpty {
+                        Clipboard.pasteChunk(chunk)
+                    }
+                } catch {
+                    Logger.error("Live ingest error: \(error)")
+                }
+            }
+        }
+    }
+
+    /// Stop the live loop, paste the remaining tail, and restore the clipboard.
+    private func finishLiveLoop(_ session: LiveSession) {
+        let task = liveTask
+        liveTask = nil
+        liveSession = nil
+        task?.cancel()
+
+        let audio = recorder.stop()
+        let original = savedClipboard
+        savedClipboard = nil
+        DispatchQueue.main.async { self.updateState(.processing) }
+
+        Task {
+            // Wait for any in-flight ingest to finish so the final pass sees the
+            // up-to-date confirmed point and we never paste duplicate text.
+            await task?.value
+            do {
+                if let tail = try await session.finish(audio), !tail.isEmpty {
+                    Clipboard.pasteChunk(tail)
+                }
+            } catch {
+                Logger.error("Live finish error: \(error)")
+            }
+            pipeline.history.add(session.transcript)
+            // Restore the user's original clipboard after the last paste settles.
+            if let original {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    Clipboard.copy(original)
+                }
             }
             DispatchQueue.main.async { self.updateState(.idle) }
         }
@@ -283,6 +368,13 @@ class StatusMenuController {
         lock.unlock()
 
         if wasRecording {
+            liveTask?.cancel()
+            liveTask = nil
+            liveSession = nil
+            if let original = savedClipboard {
+                savedClipboard = nil
+                Clipboard.copy(original)
+            }
             _ = recorder.stop()
             updateState(.idle)
         }
@@ -310,11 +402,29 @@ class StatusMenuController {
         }
     }
 
+    @objc private func toggleLiveTranscription() {
+        config.liveTranscription.toggle()
+        liveTranscriptionItem.state = config.liveTranscription ? .on : .off
+        config.saveUserConfig(key: "live_transcription", value: config.liveTranscription)
+        pipeline.log("Live transcription \(config.liveTranscription ? "enabled" : "disabled")")
+    }
+
     @objc private func openDictionary() {
+        ensureDictionaryWindow().showWindow()
+    }
+
+    @objc private func openHistory() {
+        ensureDictionaryWindow().showWindow(selectTab: DictionaryWindowController.historyTabIndex)
+    }
+
+    private func ensureDictionaryWindow() -> DictionaryWindowController {
         if dictionaryWindowController == nil {
-            dictionaryWindowController = DictionaryWindowController(dictionary: pipeline.dictionary)
+            dictionaryWindowController = DictionaryWindowController(
+                dictionary: pipeline.dictionary,
+                history: pipeline.history
+            )
         }
-        dictionaryWindowController!.showWindow()
+        return dictionaryWindowController!
     }
 
     @objc private func checkPermissions() {
