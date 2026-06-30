@@ -3,6 +3,17 @@ import CoreGraphics
 import ApplicationServices
 
 enum Clipboard {
+    /// Virtual keycode for the V key (Cmd+V paste).
+    private static let vKeyCode: CGKeyCode = 9
+
+    /// How long to wait before restoring the user's previous clipboard after a
+    /// synthetic paste. This is a best-effort race: the synthetic Cmd+V is delivered
+    /// asynchronously, so we must wait long enough for the focused app to read the
+    /// pasteboard before we overwrite it. Too short and a slow app (e.g. Electron)
+    /// pastes the *restored* value instead; too long and the user's clipboard is
+    /// "wrong" for a noticeable window. 0.3s balances both for typical apps.
+    static let restoreDelay: TimeInterval = 0.3
+
     /// Copy text to the system clipboard.
     static func copy(_ text: String) {
         let pasteboard = NSPasteboard.general
@@ -15,16 +26,14 @@ enum Clipboard {
         NSPasteboard.general.string(forType: .string)
     }
 
-    /// Copy text to clipboard, simulate Cmd+V paste, then restore previous clipboard.
-    static func pasteToFocusedApp(_ text: String) -> Bool {
-        let previous = read()
-        copy(text)
-
+    /// Post a synthetic Cmd+V to the focused app. Returns false if the events
+    /// couldn't be created. Note: a `true` return only means the events were posted,
+    /// not that the target app accepted them.
+    @discardableResult
+    private static func postPasteEvent() -> Bool {
         let source = CGEventSource(stateID: CGEventSourceStateID.hidSystemState)
-
-        // Key code 9 = V
-        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
+        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false)
         else {
             Logger.error("Failed to create CGEvent for paste")
             return false
@@ -35,13 +44,20 @@ enum Clipboard {
 
         keyDown.post(tap: CGEventTapLocation.cghidEventTap)
         keyUp.post(tap: CGEventTapLocation.cghidEventTap)
+        return true
+    }
 
-        // Restore previous clipboard after a short delay
+    /// Copy text to clipboard, simulate Cmd+V paste, then restore previous clipboard.
+    static func pasteToFocusedApp(_ text: String) -> Bool {
+        let previous = read()
+        copy(text)
+
+        guard postPasteEvent() else { return false }
+
+        // Restore previous clipboard after the paste has had time to land.
         if let previous {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                let pasteboard = NSPasteboard.general
-                pasteboard.clearContents()
-                pasteboard.setString(previous, forType: .string)
+            DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
+                copy(previous)
             }
         }
 
@@ -53,22 +69,7 @@ enum Clipboard {
     /// responsible for restoring the user's original clipboard once at the end.
     static func pasteChunk(_ text: String) {
         copy(text)
-
-        let source = CGEventSource(stateID: CGEventSourceStateID.hidSystemState)
-
-        // Key code 9 = V
-        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
-        else {
-            Logger.error("Failed to create CGEvent for paste chunk")
-            return
-        }
-
-        keyDown.flags = CGEventFlags.maskCommand
-        keyUp.flags = CGEventFlags.maskCommand
-
-        keyDown.post(tap: CGEventTapLocation.cghidEventTap)
-        keyUp.post(tap: CGEventTapLocation.cghidEventTap)
+        postPasteEvent()
     }
 
     /// Check if the app has Accessibility permission (needed for CGEvent paste).

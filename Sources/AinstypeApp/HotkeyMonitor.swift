@@ -23,9 +23,15 @@ class HotkeyMonitor {
     private var pressed = false
     private let lock = NSLock()
 
-    init(keyName: String, onPress: @escaping () -> Void, onRelease: @escaping () -> Void) {
+    /// Supported hotkey names (modifier keys only, hold-to-record).
+    static var supportedKeys: [String] { Array(keycodeMap.keys) }
+
+    /// Fails (returns nil) if `keyName` is not a supported modifier key, so a bad
+    /// config value degrades gracefully instead of crashing the app.
+    init?(keyName: String, onPress: @escaping () -> Void, onRelease: @escaping () -> Void) {
         guard let mapping = keycodeMap[keyName] else {
-            fatalError("Unsupported hotkey: \(keyName). Supported: \(Array(keycodeMap.keys))")
+            Logger.error("Unsupported hotkey '\(keyName)'. Supported: \(keycodeMap.keys.joined(separator: ", "))")
+            return nil
         }
         self.keyName = keyName
         self.targetKeyCode = mapping.keyCode

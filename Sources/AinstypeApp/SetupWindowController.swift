@@ -47,17 +47,6 @@ class SetupWindowController: NSObject, NSWindowDelegate {
         spinner.isHidden = true
     }
 
-    func updateForOptimizing() {
-        stepLabel.stringValue = "Optimizing model for your device…"
-        detailLabel.stringValue = "macOS is compiling the model for your chip.\nThis one-time setup can take up to 10 minutes.\n\nYou can close this window — progress continues in the menu bar."
-        privacyLabel.stringValue = "All transcription happens on your Mac. Your voice never leaves this device."
-        privacyLabel.isHidden = false
-        progressBar.isHidden = true
-        spinner.isHidden = false
-        spinner.startAnimation(nil)
-        dismissButton.title = "Continue in Background"
-    }
-
     func updateForReady() {
         stepLabel.stringValue = "Ready!"
         detailLabel.stringValue = "Hold the Right Command key, speak, then release.\nYour words will be typed into the focused app."

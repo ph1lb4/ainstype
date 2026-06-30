@@ -19,8 +19,7 @@ class Pipeline {
     private var bundledModelPath: String? {
         guard let resourcePath = Bundle.main.resourcePath else { return nil }
         let path = (resourcePath as NSString).appendingPathComponent("Models/\(config.transcription.model)")
-        let required = ["AudioEncoder.mlmodelc", "TextDecoder.mlmodelc", "MelSpectrogram.mlmodelc"]
-        for file in required {
+        for file in ModelState.requiredModelFiles {
             if !FileManager.default.fileExists(atPath: (path as NSString).appendingPathComponent(file)) {
                 return nil
             }
@@ -55,19 +54,10 @@ class Pipeline {
                 log("Using cached model at \(modelPath)")
             } else {
                 // No bundled model and no cache — download
-                log("Downloading model: \(model) (~950MB, one-time)...")
+                log("Downloading model: \(model) (~616MB, one-time)...")
                 status("Downloading model…")
 
-                let modelFolder = try await WhisperKit.download(
-                    variant: model,
-                    progressCallback: { [weak self] downloadProgress in
-                        let pct = downloadProgress.fractionCompleted
-                        if Int(pct * 100) % 10 == 0 {
-                            self?.log("Download: \(Int(pct * 100))%")
-                        }
-                        progress(pct)
-                    }
-                )
+                let modelFolder = try await downloadModel(model, progress: progress)
                 modelPath = modelFolder.path
                 ModelState.save(modelPath: modelPath, model: model, aneSpecialized: false)
                 log("Model downloaded and cached")
@@ -91,7 +81,7 @@ class Pipeline {
             let gpuWK = try await WhisperKit(
                 modelFolder: modelPath,
                 computeOptions: gpuOptions,
-                verbose: true,
+                verbose: config.verbose,
                 prewarm: true,
                 load: false,
                 download: false
@@ -118,6 +108,46 @@ class Pipeline {
         }
     }
 
+    /// Fail the download if no progress is reported for this long (stalled connection).
+    private static let downloadStallTimeout: TimeInterval = 90
+
+    /// Download the model, racing it against a stall watchdog: if `progressCallback`
+    /// goes silent for `downloadStallTimeout`, cancel and surface a retryable error
+    /// instead of hanging on "Downloading model…" forever.
+    private func downloadModel(_ model: String, progress: @escaping (Double) -> Void) async throws -> URL {
+        let lastProgress = OSAllocatedUnfairLock<Date>(initialState: Date())
+        let stallTimeout = Self.downloadStallTimeout
+
+        return try await withThrowingTaskGroup(of: URL.self) { group in
+            group.addTask { [weak self] in
+                try await WhisperKit.download(
+                    variant: model,
+                    progressCallback: { downloadProgress in
+                        lastProgress.withLock { $0 = Date() }
+                        let pct = downloadProgress.fractionCompleted
+                        if Int(pct * 100) % 10 == 0 {
+                            self?.log("Download: \(Int(pct * 100))%")
+                        }
+                        progress(pct)
+                    }
+                )
+            }
+            group.addTask {
+                while true {
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                    let idle = Date().timeIntervalSince(lastProgress.withLock { $0 })
+                    if idle > stallTimeout { throw PipelineError.downloadStalled }
+                }
+            }
+
+            guard let folder = try await group.next() else {
+                throw PipelineError.downloadStalled
+            }
+            group.cancelAll()
+            return folder
+        }
+    }
+
     /// Phase 2: load a second WhisperKit instance with ANE compute units and swap it in.
     /// On first run this performs CoreML ANE specialization (slow); afterwards it's a quick
     /// reload from the e5rt cache.
@@ -134,7 +164,7 @@ class Pipeline {
             let aneWK = try await WhisperKit(
                 modelFolder: modelPath,
                 computeOptions: aneOptions,
-                verbose: true,
+                verbose: config.verbose,
                 prewarm: false,
                 load: true,
                 download: false
@@ -175,7 +205,8 @@ class Pipeline {
             return
         }
 
-        log("Transcription: \(rawText.prefix(200))")
+        // Privacy: never log transcribed content — only its size.
+        log("Transcribed \(rawText.count) characters")
 
         // Dictionary replacements
         let text = dictionary.applyReplacements(rawText)
@@ -202,10 +233,12 @@ class Pipeline {
 
     enum PipelineError: Error, LocalizedError {
         case modelNotReady
+        case downloadStalled
 
         var errorDescription: String? {
             switch self {
             case .modelNotReady: "Whisper model not loaded yet — still initializing"
+            case .downloadStalled: "Model download stalled — check your connection and try again"
             }
         }
     }

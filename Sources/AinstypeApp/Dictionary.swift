@@ -82,15 +82,39 @@ class DictionaryManager {
     }
 
     /// Apply post-transcription spoken→written replacements (case-insensitive).
+    ///
+    /// Rules are applied longest-spoken-phrase first so they're deterministic
+    /// (Swift `Dictionary` iteration order is not) and so a longer phrase isn't
+    /// partially consumed by a shorter overlapping rule. Word-like terms match on
+    /// word boundaries so e.g. "open paren" doesn't fire inside another word.
     func applyReplacements(_ text: String) -> String {
         var result = text
-        for (spoken, written) in replacements {
-            result = result.replacingOccurrences(
-                of: spoken,
-                with: written,
-                options: .caseInsensitive
-            )
+        let ordered = replacements.sorted { $0.key.count > $1.key.count }
+        for (spoken, written) in ordered where !spoken.isEmpty {
+            result = Self.replaceOccurrences(of: spoken, with: written, in: result)
         }
         return result
+    }
+
+    private static func replaceOccurrences(of spoken: String, with written: String, in text: String) -> String {
+        let wordLike = (spoken.first?.isLetter ?? false || spoken.first?.isNumber ?? false)
+            && (spoken.last?.isLetter ?? false || spoken.last?.isNumber ?? false)
+
+        guard wordLike,
+              let regex = try? NSRegularExpression(
+                pattern: "\\b" + NSRegularExpression.escapedPattern(for: spoken) + "\\b",
+                options: [.caseInsensitive]
+              )
+        else {
+            return text.replacingOccurrences(of: spoken, with: written, options: .caseInsensitive)
+        }
+
+        let range = NSRange(text.startIndex..., in: text)
+        return regex.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: range,
+            withTemplate: NSRegularExpression.escapedTemplate(for: written)
+        )
     }
 }

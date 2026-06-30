@@ -1,4 +1,5 @@
 import AppKit
+import UserNotifications
 
 /// Manages the NSStatusItem, menu, and UI state.
 class StatusMenuController {
@@ -24,9 +25,15 @@ class StatusMenuController {
     private var hotkeyMonitor: HotkeyMonitor?
     private var recorder: AudioRecorder!
     private var healthTimer: Timer?
+    private var maxRecordingTimer: Timer?
     private var currentState: State = .setup
     private var isRecording = false
     private let lock = NSLock()
+
+    /// Safety stop: if a hotkey key-up is ever missed (focus switch, monitor
+    /// restart mid-hold), recording would otherwise run — and hold the mic open —
+    /// forever. Auto-stop after this long.
+    private let maxRecordingDuration: TimeInterval = 120
 
     // Live (streaming) transcription state
     private var liveSession: LiveSession?
@@ -90,6 +97,9 @@ class StatusMenuController {
         // Create recorder
         recorder = AudioRecorder(sampleRate: config.recording.sampleRate)
 
+        // Ask for permission to post our error/empty-recording notifications.
+        requestNotificationAuthorization()
+
         // Start hotkey monitor
         startHotkeyMonitor()
 
@@ -136,6 +146,10 @@ class StatusMenuController {
                             // prewarm() to avoid keeping the mic AU open.
                             self?.recorder.prewarm()
                             if let setup = self?.setupWindowController {
+                                // First run: proactively request the permissions paste
+                                // needs, so the very first transcription actually lands
+                                // instead of silently falling back to copy-only.
+                                self?.requestFirstRunPermissions()
                                 setup.updateForReady()
                                 setup.onDismiss = { [weak self] in
                                     self?.setupWindowController = nil
@@ -202,15 +216,17 @@ class StatusMenuController {
 
     // MARK: - Hotkey Callbacks
 
-    private var modelReady: Bool {
+    /// Recording may only begin from `.idle`. Allowing it during `.processing`
+    /// previously let a second recording start mid-transcription, after which the
+    /// first run's completion would clobber state back to `.idle` and two
+    /// transcriptions could race on the one WhisperKit instance.
+    private var canStartRecording: Bool {
         if case .idle = currentState { return true }
-        if case .recording = currentState { return true }
-        if case .processing = currentState { return true }
         return false
     }
 
     private func onHotkeyPress() {
-        guard modelReady else { return }
+        guard canStartRecording else { return }
 
         lock.lock()
         guard !isRecording else { lock.unlock(); return }
@@ -219,7 +235,10 @@ class StatusMenuController {
 
         do {
             try recorder.start()
-            DispatchQueue.main.async { self.updateState(.recording) }
+            DispatchQueue.main.async {
+                self.updateState(.recording)
+                self.startMaxRecordingTimer()
+            }
             if config.liveTranscription {
                 startLiveLoop()
             }
@@ -228,6 +247,10 @@ class StatusMenuController {
             lock.lock()
             isRecording = false
             lock.unlock()
+            Task { await self.showNotification(
+                title: "ainstype",
+                body: "Couldn't start recording. Check microphone access in System Settings → Privacy & Security."
+            ) }
         }
     }
 
@@ -236,6 +259,8 @@ class StatusMenuController {
         guard isRecording else { lock.unlock(); return }
         isRecording = false
         lock.unlock()
+
+        DispatchQueue.main.async { self.cancelMaxRecordingTimer() }
 
         if config.liveTranscription, let session = liveSession {
             finishLiveLoop(session)
@@ -249,15 +274,16 @@ class StatusMenuController {
             do {
                 if audio.isEmpty {
                     Logger.log("Empty audio buffer")
-                    await showNotification(title: "ainstype", body: "Recording was empty. Check mic permissions.")
+                    await showNotification(title: "ainstype", body: "Recording was empty — nothing was captured. Check microphone access.")
                 } else {
                     try await pipeline.processAudio(audio, config: config)
                 }
             } catch {
                 Logger.error("Pipeline error: \(error)")
-                await showNotification(title: "ainstype Error", body: String(describing: error).prefix(200).description)
+                let message = (error as? LocalizedError)?.errorDescription ?? "Transcription failed. Please try again."
+                await showNotification(title: "ainstype", body: message)
             }
-            DispatchQueue.main.async { self.updateState(.idle) }
+            self.finishProcessing()
         }
     }
 
@@ -313,31 +339,63 @@ class StatusMenuController {
             pipeline.history.add(session.transcript)
             // Restore the user's original clipboard after the last paste settles.
             if let original {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Clipboard.restoreDelay) {
                     Clipboard.copy(original)
                 }
             }
-            DispatchQueue.main.async { self.updateState(.idle) }
+            self.finishProcessing()
         }
+    }
+
+    /// Return to `.idle` after processing, but only if we're still in `.processing`
+    /// — never clobber a `.recording`/`.error`/`.warning` state set in the meantime.
+    private func finishProcessing() {
+        DispatchQueue.main.async {
+            if case .processing = self.currentState { self.updateState(.idle) }
+        }
+    }
+
+    // MARK: - Recording Safety Timer
+
+    private func startMaxRecordingTimer() {
+        cancelMaxRecordingTimer()
+        maxRecordingTimer = Timer.scheduledTimer(withTimeInterval: maxRecordingDuration, repeats: false) { [weak self] _ in
+            Logger.log("Max recording duration reached — auto-stopping")
+            self?.onHotkeyRelease()
+        }
+    }
+
+    private func cancelMaxRecordingTimer() {
+        maxRecordingTimer?.invalidate()
+        maxRecordingTimer = nil
     }
 
     // MARK: - Hotkey Monitor
 
     private func startHotkeyMonitor() {
-        hotkeyMonitor = HotkeyMonitor(
-            keyName: config.recording.hotkey,
-            onPress: { [weak self] in self?.onHotkeyPress() },
-            onRelease: { [weak self] in self?.onHotkeyRelease() }
-        )
+        if hotkeyMonitor == nil {
+            hotkeyMonitor = HotkeyMonitor(
+                keyName: config.recording.hotkey,
+                onPress: { [weak self] in self?.onHotkeyPress() },
+                onRelease: { [weak self] in self?.onHotkeyRelease() }
+            )
+        }
 
-        if hotkeyMonitor!.start() { return }
+        // Config.validate() guarantees a supported hotkey, so this normally succeeds.
+        guard let monitor = hotkeyMonitor else {
+            Logger.error("Hotkey monitor unavailable for '\(config.recording.hotkey)'")
+            updateState(.error("Unsupported hotkey: \(config.recording.hotkey)"))
+            return
+        }
+
+        if monitor.start() { return }
 
         // Monitor failed — request permission (adds app to System Settings list)
         Logger.log("Monitor failed to start, requesting Input Monitoring permission...")
         _ = requestInputMonitoring()
 
         // Retry once after requesting
-        if hotkeyMonitor!.start() { return }
+        if monitor.start() { return }
 
         // Still failed — warn in menu bar but don't show a blocking alert.
         // Debug builds often fail this check despite permission being granted.
@@ -361,6 +419,7 @@ class StatusMenuController {
 
     func handleWake() {
         hotkeyMonitor?.reset()
+        cancelMaxRecordingTimer()
 
         lock.lock()
         let wasRecording = isRecording
@@ -442,6 +501,11 @@ class StatusMenuController {
             }
         }
 
+        if !hasAccessibility {
+            Clipboard.requestAccessibility()
+            lines.append("\nRequested Accessibility — grant it in System Settings, then reopen this app.")
+        }
+
         let alert = NSAlert()
         alert.messageText = "Permission Status"
         alert.informativeText = lines.joined(separator: "\n")
@@ -454,12 +518,40 @@ class StatusMenuController {
         NSApp.terminate(nil)
     }
 
+    // MARK: - Permissions
+
+    /// First-run: request the permissions the paste path needs up front so the
+    /// first transcription lands instead of silently falling back to copy-only.
+    private func requestFirstRunPermissions() {
+        AudioRecorder.requestPermission { _ in }
+        if !Clipboard.checkAccessibility() {
+            Clipboard.requestAccessibility()
+        }
+    }
+
     // MARK: - Notifications
 
+    private func requestNotificationAuthorization() {
+        // UNUserNotificationCenter requires a real app bundle; skip under `swift run`.
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, error in
+            if let error { Logger.error("Notification authorization failed: \(error)") }
+        }
+    }
+
     private func showNotification(title: String, body: String) async {
-        let notification = NSUserNotification()
-        notification.title = title
-        notification.informativeText = body
-        NSUserNotificationCenter.default.deliver(notification)
+        guard Bundle.main.bundleIdentifier != nil else {
+            Logger.log("Notification (no bundle): \(title) — \(body)")
+            return
+        }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        do {
+            try await UNUserNotificationCenter.current().add(request)
+        } catch {
+            Logger.error("Failed to deliver notification: \(error)")
+        }
     }
 }

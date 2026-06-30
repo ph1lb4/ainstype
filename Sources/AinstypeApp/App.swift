@@ -17,6 +17,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let config = Config.load()
+        Logger.verboseEnabled = config.verbose
 
         pipeline = Pipeline(config: config)
         statusMenu = StatusMenuController(config: config, pipeline: pipeline)

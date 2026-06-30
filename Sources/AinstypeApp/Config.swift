@@ -3,12 +3,10 @@ import TOMLKit
 
 struct RecordingConfig {
     var hotkey: String = "cmd_r"
-    var mechanism: String = "hold"
     var sampleRate: Int = 16000
 }
 
 struct TranscriptionConfig {
-    var engine: String = "whisperkit"
     var model: String = "openai_whisper-large-v3-v20240930_turbo_632MB"
 }
 
@@ -55,7 +53,20 @@ struct Config {
             config.applyTOML(data)
         }
 
+        config.validate()
         return config
+    }
+
+    /// Clamp/repair values that would otherwise crash or silently break the app.
+    private mutating func validate() {
+        if !HotkeyMonitor.supportedKeys.contains(recording.hotkey) {
+            Logger.error("Invalid hotkey '\(recording.hotkey)' in config — falling back to 'cmd_r'. Supported: \(HotkeyMonitor.supportedKeys.joined(separator: ", "))")
+            recording.hotkey = "cmd_r"
+        }
+        if recording.sampleRate <= 0 {
+            Logger.error("Invalid sample_rate \(recording.sampleRate) in config — falling back to 16000")
+            recording.sampleRate = 16000
+        }
     }
 
     mutating func applyTOML(_ tomlString: String) {
@@ -68,12 +79,10 @@ struct Config {
 
         if let rec = table["recording"]?.table {
             if let hotkey = rec["hotkey"]?.string { self.recording.hotkey = hotkey }
-            if let mechanism = rec["mechanism"]?.string { self.recording.mechanism = mechanism }
             if let sr = rec["sample_rate"]?.int { self.recording.sampleRate = sr }
         }
 
         if let trans = table["transcription"]?.table {
-            if let engine = trans["engine"]?.string { self.transcription.engine = engine }
             if let model = trans["model"]?.string {
                 // Map Python MLX model names to WhisperKit CoreML names
                 self.transcription.model = Self.mapModelName(model)

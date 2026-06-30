@@ -39,10 +39,10 @@ class AudioRecorder {
     /// the CoreAudio input unit alive, which other apps interpret as an active
     /// call and respond to by ducking their playback.
     func start() throws {
-        guard !isRecording else { return }
-
         lock.lock()
+        if isRecording { lock.unlock(); return }
         frames = []
+        isRecording = true
         lock.unlock()
 
         let engine = AVAudioEngine()
@@ -102,8 +102,16 @@ class AudioRecorder {
             self.lock.unlock()
         }
 
-        try engine.start()
-        isRecording = true
+        do {
+            try engine.start()
+        } catch {
+            // Roll back state so a failed start doesn't leave us wedged.
+            self.engine = nil
+            lock.lock()
+            isRecording = false
+            lock.unlock()
+            throw error
+        }
         Logger.log("AudioRecorder started")
     }
 
@@ -119,7 +127,10 @@ class AudioRecorder {
 
     /// Stop recording and return concatenated audio samples.
     func stop() -> [Float] {
-        guard isRecording else { return [] }
+        lock.lock()
+        if !isRecording { lock.unlock(); return [] }
+        isRecording = false
+        lock.unlock()
 
         if let engine {
             engine.inputNode.removeTap(onBus: 0)
@@ -128,7 +139,6 @@ class AudioRecorder {
         // Drop the engine so the CoreAudio input unit is released and other
         // apps stop treating the system as if a call is active.
         engine = nil
-        isRecording = false
 
         lock.lock()
         let allFrames = frames

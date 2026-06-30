@@ -10,6 +10,9 @@ struct ModelState: Codable {
 
     private static let stateURL = Config.configDir.appendingPathComponent("model_state.json")
 
+    /// Compiled CoreML components that must be present for a model directory to be usable.
+    static let requiredModelFiles = ["AudioEncoder.mlmodelc", "TextDecoder.mlmodelc", "MelSpectrogram.mlmodelc"]
+
     // Backward-compatible decoding (old JSON files won't have aneSpecialized)
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -40,8 +43,7 @@ struct ModelState: Codable {
 
         // Validate that model files still exist on disk
         let modelURL = URL(fileURLWithPath: state.modelPath)
-        let requiredFiles = ["AudioEncoder.mlmodelc", "TextDecoder.mlmodelc", "MelSpectrogram.mlmodelc"]
-        for file in requiredFiles {
+        for file in requiredModelFiles {
             if !FileManager.default.fileExists(atPath: modelURL.appendingPathComponent(file).path) {
                 print("[ainstype] Model file missing: \(file), will re-download")
                 return nil

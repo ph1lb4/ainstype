@@ -11,9 +11,9 @@
     <key>CFBundleExecutable</key>
     <string>AinstypeApp</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.0</string>
+    <string>0.3.0</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>
@@ -24,8 +24,6 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>ainstype needs microphone access to record speech for transcription.</string>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>ainstype needs accessibility access to paste transcribed text into the active app.</string>
     <key>LSArchitecturePriority</key>
     <array>
         <string>arm64</string>

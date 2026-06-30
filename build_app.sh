@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 APP_NAME="ainstype"
 BUNDLE_NAME="${APP_NAME}.app"
 DMG_NAME="${APP_NAME}-${VERSION}.dmg"
@@ -82,6 +82,15 @@ echo "Binary size: ${BINARY_SIZE}"
 
 echo ""
 echo "=== Code signing ==="
+
+if ! security find-identity -v -p codesigning | grep -q "${IDENTITY}"; then
+    echo "ERROR: signing identity not found in keychain:"
+    echo "  ${IDENTITY}"
+    echo "Set your own when building from a fork (see top of this script):"
+    echo "  SIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' TEAM_ID=TEAMID ./build_app.sh"
+    echo "List available identities with: security find-identity -v -p codesigning"
+    exit 1
+fi
 
 codesign --force --deep --options runtime \
     --entitlements "${ENTITLEMENTS}" \
