@@ -67,9 +67,41 @@ enum Clipboard {
     /// Copy text and simulate Cmd+V, WITHOUT saving/restoring the clipboard.
     /// Used by live mode where many chunks are pasted in sequence; the caller is
     /// responsible for restoring the user's original clipboard once at the end.
+    ///
+    /// Any leading whitespace — the only thing separating this chunk from the
+    /// previously pasted word — is typed as real keystrokes instead of pasted.
+    /// Several text engines (web & Electron inputs, rich-text `NSTextView`s with
+    /// smart copy/paste) silently strip leading whitespace from pasted content,
+    /// which would merge this chunk into the previous word. Terminals and plain
+    /// native fields paste it raw, which is why the merge only shows up in some
+    /// apps. Typed keystrokes go through the normal input path and survive
+    /// everywhere.
     static func pasteChunk(_ text: String) {
-        copy(text)
+        let leading = text.prefix { $0 == " " }
+        let body = String(text.dropFirst(leading.count))
+        if !leading.isEmpty { typeText(String(leading)) }
+        guard !body.isEmpty else { return }
+        copy(body)
         postPasteEvent()
+    }
+
+    /// Insert `text` as synthetic Unicode key events (not a paste), so it goes
+    /// through the normal keyboard-input path rather than the pasteboard.
+    static func typeText(_ text: String) {
+        let source = CGEventSource(stateID: CGEventSourceStateID.hidSystemState)
+        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
+        else {
+            Logger.error("Failed to create CGEvent for typing")
+            return
+        }
+
+        var utf16 = Array(text.utf16)
+        keyDown.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
+        keyUp.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
+
+        keyDown.post(tap: CGEventTapLocation.cghidEventTap)
+        keyUp.post(tap: CGEventTapLocation.cghidEventTap)
     }
 
     /// Check if the app has Accessibility permission (needed for CGEvent paste).
