@@ -38,7 +38,6 @@ class StatusMenuController {
     // Live (streaming) transcription state
     private var liveSession: LiveSession?
     private var liveTask: Task<Void, Never>?
-    private var savedClipboard: String?
 
     init(config: Config, pipeline: Pipeline) {
         self.config = config
@@ -289,22 +288,21 @@ class StatusMenuController {
 
     // MARK: - Live Transcription Loop
 
-    /// Periodically transcribe the growing buffer and paste newly-confirmed text.
+    /// Periodically transcribe the growing buffer and type newly-confirmed text.
     private func startLiveLoop() {
-        savedClipboard = Clipboard.read()
         let session = pipeline.makeLiveSession(config: config)
         liveSession = session
 
         liveTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_500_000_000) // ~1.5s cadence
+                try? await Task.sleep(nanoseconds: 1_000_000_000) // ~1s cadence
                 if Task.isCancelled { break }
                 guard let self else { break }
                 let samples = self.recorder.currentSamples()
                 guard !samples.isEmpty else { continue }
                 do {
                     if let chunk = try await session.ingest(samples), !chunk.isEmpty {
-                        Clipboard.pasteChunk(chunk)
+                        Clipboard.typeText(chunk)
                     }
                 } catch {
                     Logger.error("Live ingest error: \(error)")
@@ -313,7 +311,7 @@ class StatusMenuController {
         }
     }
 
-    /// Stop the live loop, paste the remaining tail, and restore the clipboard.
+    /// Stop the live loop and type the remaining tail.
     private func finishLiveLoop(_ session: LiveSession) {
         let task = liveTask
         liveTask = nil
@@ -321,28 +319,20 @@ class StatusMenuController {
         task?.cancel()
 
         let audio = recorder.stop()
-        let original = savedClipboard
-        savedClipboard = nil
         DispatchQueue.main.async { self.updateState(.processing) }
 
         Task {
             // Wait for any in-flight ingest to finish so the final pass sees the
-            // up-to-date confirmed point and we never paste duplicate text.
+            // up-to-date confirmed point and we never emit duplicate text.
             await task?.value
             do {
                 if let tail = try await session.finish(audio), !tail.isEmpty {
-                    Clipboard.pasteChunk(tail)
+                    Clipboard.typeText(tail)
                 }
             } catch {
                 Logger.error("Live finish error: \(error)")
             }
-            pipeline.history.add(session.transcript)
-            // Restore the user's original clipboard after the last paste settles.
-            if let original {
-                DispatchQueue.main.asyncAfter(deadline: .now() + Clipboard.restoreDelay) {
-                    Clipboard.copy(original)
-                }
-            }
+            pipeline.history.add(session.transcript.trimmingCharacters(in: .whitespacesAndNewlines))
             self.finishProcessing()
         }
     }
@@ -430,10 +420,6 @@ class StatusMenuController {
             liveTask?.cancel()
             liveTask = nil
             liveSession = nil
-            if let original = savedClipboard {
-                savedClipboard = nil
-                Clipboard.copy(original)
-            }
             _ = recorder.stop()
             updateState(.idle)
         }

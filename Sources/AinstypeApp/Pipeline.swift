@@ -256,13 +256,18 @@ final class LiveSession {
     private let config: Config
     private let sampleRate: Float = 16000
     /// Audio newer than this many seconds (from the end of the buffer) is left
-    /// unconfirmed, since Whisper may still revise the most recent words.
-    private let confirmationMargin: Float = 2.0
+    /// unconfirmed, since Whisper may still revise the most recent words. Kept
+    /// small: with word-level confirmation this is the main knob on how quickly
+    /// spoken words surface, so it trades latency against last-word stability.
+    private let confirmationMargin: Float = 1.0
 
     private var lastConfirmedEnd: Float = 0
     private var hasEmitted = false
+    /// The last word emitted (normalized), used to drop an accidental repeat when
+    /// a decode boundary re-transcribes the word it was clipped on.
+    private var lastWord = ""
     /// Full text emitted so far this session (confirmed chunks + final tail),
-    /// for recovery via the history window if pasting failed.
+    /// for recovery via the history window if inserting failed.
     private(set) var transcript = ""
 
     init(pipeline: Pipeline, config: Config) {
@@ -280,8 +285,8 @@ final class LiveSession {
         let confirmBefore = totalSeconds - confirmationMargin
         guard confirmBefore > lastConfirmedEnd else { return nil }
 
-        let segments = try await transcribe(samples, using: wk)
-        let newlyConfirmed = segments.filter { $0.end > lastConfirmedEnd && $0.end <= confirmBefore }
+        let units = confirmableUnits(try await transcribe(samples, using: wk))
+        let newlyConfirmed = units.filter { $0.end > lastConfirmedEnd && $0.end <= confirmBefore }
         guard let last = newlyConfirmed.last else { return nil }
         lastConfirmedEnd = last.end
 
@@ -292,34 +297,84 @@ final class LiveSession {
     /// confirmed point (the unconfirmed tail).
     func finish(_ samples: [Float]) async throws -> String? {
         guard let wk = pipeline.whisperKitBox.withLock({ $0 }) else { return nil }
-        let segments = try await transcribe(samples, using: wk)
-        let remaining = segments.filter { $0.end > lastConfirmedEnd }
+        let units = confirmableUnits(try await transcribe(samples, using: wk))
+        let remaining = units.filter { $0.end > lastConfirmedEnd }
         guard !remaining.isEmpty else { return nil }
         return emit(remaining.map { $0.text }.joined())
+    }
+
+    /// The smallest text units we can confirm independently, each tagged with the
+    /// audio time it ends at: individual words when the model returns word-level
+    /// timestamps, otherwise whole segments.
+    ///
+    /// Words are strongly preferred. Confirming per word lets text surface mid-
+    /// sentence instead of stalling until Whisper closes a segment at a pause
+    /// (which is what made the first output take 10s+ during continuous speech).
+    /// Their `end` timestamps are also precise, so clipping the next decode there
+    /// excludes the confirmed word's audio — segment `end` is coarse enough that
+    /// the boundary word's audio leaked into the next pass and was emitted twice.
+    private struct Unit { let text: String; let end: Float }
+    private func confirmableUnits(_ segments: [TranscriptionSegment]) -> [Unit] {
+        segments.flatMap { segment -> [Unit] in
+            if let words = segment.words, !words.isEmpty {
+                return words.map { Unit(text: $0.word, end: $0.end) }
+            }
+            return [Unit(text: segment.text, end: segment.end)]
+        }
     }
 
     private func transcribe(_ samples: [Float], using wk: WhisperKit) async throws -> [TranscriptionSegment] {
         var options = DecodingOptions(language: config.language, temperature: 0)
         // Decode clean word text (no <|...|> special/timestamp tokens in segment text).
         options.skipSpecialTokens = true
-        // Only decode audio after the last confirmed point; segment timestamps
-        // remain absolute from the start of `samples`.
+        // Ask for word-level timestamps so we can confirm word-by-word; the model
+        // falls back to segment-level in `confirmableUnits` if it returns none.
+        options.wordTimestamps = true
+        // Only decode audio after the last confirmed point; segment and word
+        // timestamps remain absolute from the start of `samples`.
         options.clipTimestamps = [lastConfirmedEnd]
         let results = try await wk.transcribe(audioArray: samples, decodeOptions: options)
         return results.flatMap { $0.segments }
     }
 
-    /// Apply dictionary replacements and strip the leading space Whisper puts on
-    /// the very first segment. Returns nil if the result is empty.
+    /// Prepare a newly-confirmed chunk for insertion. Whisper prefixes each word/
+    /// segment with a leading space, which naturally separates chunks once they
+    /// are typed (typed spaces, unlike pasted edge whitespace, are never trimmed
+    /// by the target field). The very first chunk's leading space is dropped so
+    /// text doesn't start with a space. A leading word that merely repeats the
+    /// last word already emitted is dropped — that happens when the previous
+    /// decode was clipped a hair inside the boundary word and this pass re-
+    /// transcribes it (the `correctlycorrectly` / `whichwhich` artifact). Returns
+    /// nil if nothing is left to emit.
     private func emit(_ raw: String) -> String? {
         var text = raw
         if !hasEmitted {
             text = String(text.drop { $0 == " " })
         }
+        text = dropDuplicateLeadingWord(text)
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         hasEmitted = true
+        if let last = text.split(separator: " ").last {
+            lastWord = Self.normalizeWord(String(last))
+        }
         let replaced = pipeline.dictionary.applyReplacements(text)
         transcript += replaced
         return replaced
+    }
+
+    /// If `text`'s first word repeats `lastWord`, remove it (keeping the space
+    /// that precedes the following word so separation is preserved).
+    private func dropDuplicateLeadingWord(_ text: String) -> String {
+        guard !lastWord.isEmpty else { return text }
+        let afterSpaces = text.drop { $0 == " " }
+        let firstWord = afterSpaces.prefix { $0 != " " }
+        guard Self.normalizeWord(String(firstWord)) == lastWord else { return text }
+        return String(afterSpaces.dropFirst(firstWord.count))
+    }
+
+    /// Lowercased, with surrounding punctuation stripped, for comparing words
+    /// regardless of trailing periods/commas Whisper may attach.
+    private static func normalizeWord(_ word: String) -> String {
+        word.trimmingCharacters(in: CharacterSet.alphanumerics.inverted).lowercased()
     }
 }

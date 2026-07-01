@@ -64,44 +64,47 @@ enum Clipboard {
         return true
     }
 
-    /// Copy text and simulate Cmd+V, WITHOUT saving/restoring the clipboard.
-    /// Used by live mode where many chunks are pasted in sequence; the caller is
-    /// responsible for restoring the user's original clipboard once at the end.
+    /// Insert `text` by synthesizing per-character key events, the way a text
+    /// expander does — NOT via the pasteboard. Used by live mode, which inserts
+    /// many small chunks as words are confirmed.
     ///
-    /// Any leading whitespace — the only thing separating this chunk from the
-    /// previously pasted word — is typed as real keystrokes instead of pasted.
-    /// Several text engines (web & Electron inputs, rich-text `NSTextView`s with
-    /// smart copy/paste) silently strip leading whitespace from pasted content,
-    /// which would merge this chunk into the previous word. Terminals and plain
-    /// native fields paste it raw, which is why the merge only shows up in some
-    /// apps. Typed keystrokes go through the normal input path and survive
-    /// everywhere.
-    static func pasteChunk(_ text: String) {
-        let leading = text.prefix { $0 == " " }
-        let body = String(text.dropFirst(leading.count))
-        if !leading.isEmpty { typeText(String(leading)) }
-        guard !body.isEmpty else { return }
-        copy(body)
-        postPasteEvent()
-    }
-
-    /// Insert `text` as synthetic Unicode key events (not a paste), so it goes
-    /// through the normal keyboard-input path rather than the pasteboard.
+    /// Live mode cannot paste: Slack and other Electron / rich-text editors strip
+    /// whitespace at both edges of every paste, so a space between two separately
+    /// pasted chunks always vanishes and the words merge (`therevised`,
+    /// `shouldwork`). Typed characters go through the normal keyboard-input path,
+    /// so their spaces survive everywhere. Typing also leaves the clipboard
+    /// untouched, so live mode no longer needs to save/restore it.
+    ///
+    /// The push-to-talk hotkey is a modifier key (⌘/⌥/⌃) that is physically held
+    /// for the whole dictation, so every synthesized keystroke must be emitted
+    /// with NO modifier flags — otherwise the held ⌘ combines with each letter
+    /// into a shortcut (`t` → ⌘T opens a browser tab). Two safeguards ensure a
+    /// clean event: a private-state source carries no hardware-modifier state to
+    /// inherit, and each event's flags are explicitly cleared.
     static func typeText(_ text: String) {
-        let source = CGEventSource(stateID: CGEventSourceStateID.hidSystemState)
-        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
-        else {
-            Logger.error("Failed to create CGEvent for typing")
-            return
+        let source = CGEventSource(stateID: CGEventSourceStateID.privateState)
+        // One character per event is the most broadly compatible approach; some
+        // apps only accept the first character of a multi-character unicode event.
+        for character in text {
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
+            else {
+                Logger.error("Failed to create CGEvent for typing")
+                return
+            }
+
+            var units = Array(String(character).utf16)
+            keyDown.keyboardSetUnicodeString(stringLength: units.count, unicodeString: &units)
+            keyUp.keyboardSetUnicodeString(stringLength: units.count, unicodeString: &units)
+
+            // Strip any inherited modifier flags so the held hotkey can't turn
+            // this keystroke into a shortcut.
+            keyDown.flags = CGEventFlags(rawValue: 0)
+            keyUp.flags = CGEventFlags(rawValue: 0)
+
+            keyDown.post(tap: CGEventTapLocation.cghidEventTap)
+            keyUp.post(tap: CGEventTapLocation.cghidEventTap)
         }
-
-        var utf16 = Array(text.utf16)
-        keyDown.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-        keyUp.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-
-        keyDown.post(tap: CGEventTapLocation.cghidEventTap)
-        keyUp.post(tap: CGEventTapLocation.cghidEventTap)
     }
 
     /// Check if the app has Accessibility permission (needed for CGEvent paste).
