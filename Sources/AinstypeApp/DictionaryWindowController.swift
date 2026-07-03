@@ -1,10 +1,23 @@
 import AppKit
 
-/// Manages a window for editing the dictionary (terms and replacements).
+/// Reads and applies the app settings surfaced in the Settings tab. Implemented
+/// by `StatusMenuController`, which owns the live `Config` and the components
+/// (hotkey monitor, pipeline) that changes must be applied to.
+protocol SettingsDelegate: AnyObject {
+    func settingsCurrentConfig() -> Config
+    func settingsDidChangeHotkey(_ key: String)
+    func settingsDidChangeLanguage(_ language: String?)
+    func settingsDidToggleLiveTranscription(_ enabled: Bool)
+    func settingsDidChangeLiveMode(_ mode: LiveMode)
+}
+
+/// Manages the app window: a Settings tab plus the dictionary (terms and
+/// replacements) and transcription history.
 class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private var window: NSWindow?
     private let dictionary: DictionaryManager
     private let history: TranscriptionHistory
+    weak var settingsDelegate: SettingsDelegate?
 
     private var words: [String] = []
     private var names: [String] = []
@@ -17,8 +30,27 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     private var tabView: NSTabView!
     private var historyTextView: NSTextView!
 
-    /// Index of the History tab, for `showWindow(selectTab:)`.
-    static let historyTabIndex = 3
+    // Settings-tab controls.
+    private var hotkeyPopup: NSPopUpButton!
+    private var languageField: NSTextField!
+    private var liveCheckbox: NSButton!
+    private var liveModePopup: NSPopUpButton!
+
+    /// Hotkey config value ↔ human label, in display order.
+    private let hotkeyOptions: [(key: String, label: String)] = [
+        ("cmd_r", "Right Command (⌘)"),
+        ("cmd", "Left Command (⌘)"),
+        ("alt_r", "Right Option (⌥)"),
+        ("alt", "Left Option (⌥)"),
+        ("ctrl_r", "Right Control (⌃)"),
+        ("ctrl", "Left Control (⌃)"),
+    ]
+
+    /// Tab indices, for `showWindow(selectTab:)`. Order: Settings, Words, Names,
+    /// Replacements, History.
+    static let settingsTabIndex = 0
+    static let wordsTabIndex = 1
+    static let historyTabIndex = 4
 
     init(dictionary: DictionaryManager, history: TranscriptionHistory) {
         self.dictionary = dictionary
@@ -35,6 +67,7 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         namesTable.reloadData()
         replacementsTable.reloadData()
         loadHistory()
+        populateSettings()
         if let selectTab {
             tabView.selectTabViewItem(at: selectTab)
         }
@@ -86,7 +119,7 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
             backing: .buffered,
             defer: false
         )
-        w.title = "Dictionary"
+        w.title = "ainstype"
         w.center()
         w.delegate = self
         w.minSize = NSSize(width: 360, height: 300)
@@ -95,6 +128,7 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         let tabView = NSTabView()
         tabView.translatesAutoresizingMaskIntoConstraints = false
 
+        tabView.addTabViewItem(makeSettingsTab())
         tabView.addTabViewItem(makeTab(title: "Words", tag: 0))
         tabView.addTabViewItem(makeTab(title: "Names", tag: 1))
         tabView.addTabViewItem(makeTab(title: "Replacements", tag: 2))
@@ -110,6 +144,99 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         ])
 
         window = w
+    }
+
+    // MARK: - Settings Tab
+
+    private func makeSettingsTab() -> NSTabViewItem {
+        let item = NSTabViewItem()
+        item.label = "Settings"
+
+        hotkeyPopup = NSPopUpButton()
+        hotkeyPopup.addItems(withTitles: hotkeyOptions.map { $0.label })
+        hotkeyPopup.target = self
+        hotkeyPopup.action = #selector(hotkeyChanged)
+
+        languageField = NSTextField()
+        languageField.placeholderString = "auto-detect (e.g. en, de)"
+        languageField.delegate = self
+        languageField.widthAnchor.constraint(equalToConstant: 200).isActive = true
+
+        liveCheckbox = NSButton(checkboxWithTitle: "Insert text live while recording", target: self, action: #selector(liveToggled))
+
+        liveModePopup = NSPopUpButton()
+        liveModePopup.addItems(withTitles: ["Sentence", "Word"])
+        liveModePopup.target = self
+        liveModePopup.action = #selector(liveModeChanged)
+
+        let hint = NSTextField(wrappingLabelWithString: "Sentence commits a whole phrase at a time; Word commits each word as it's confirmed (snappier, but types in bursts). Other options (model, sample rate) live in ~/.config/ainstype/config.toml.")
+        hint.font = .systemFont(ofSize: 10)
+        hint.textColor = .secondaryLabelColor
+        hint.preferredMaxLayoutWidth = 360
+
+        let stack = NSStackView(views: [
+            settingsRow("Hotkey:", hotkeyPopup),
+            settingsRow("Language:", languageField),
+            settingsRow("", liveCheckbox),
+            settingsRow("Live mode:", liveModePopup),
+            hint,
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView()
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 20),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -20),
+        ])
+
+        item.view = container
+        return item
+    }
+
+    /// A labeled form row: a fixed-width right-aligned label next to a control.
+    private func settingsRow(_ label: String, _ control: NSView) -> NSView {
+        let l = NSTextField(labelWithString: label)
+        l.alignment = .right
+        l.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        let row = NSStackView(views: [l, control])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        return row
+    }
+
+    /// Load current config values into the settings controls.
+    private func populateSettings() {
+        guard let config = settingsDelegate?.settingsCurrentConfig() else { return }
+        if let idx = hotkeyOptions.firstIndex(where: { $0.key == config.recording.hotkey }) {
+            hotkeyPopup.selectItem(at: idx)
+        }
+        languageField.stringValue = config.language ?? ""
+        liveCheckbox.state = config.liveTranscription ? .on : .off
+        liveModePopup.selectItem(at: config.liveMode == .word ? 1 : 0)
+        liveModePopup.isEnabled = config.liveTranscription
+    }
+
+    @objc private func hotkeyChanged() {
+        let idx = hotkeyPopup.indexOfSelectedItem
+        guard idx >= 0, idx < hotkeyOptions.count else { return }
+        settingsDelegate?.settingsDidChangeHotkey(hotkeyOptions[idx].key)
+    }
+
+    @objc private func liveToggled() {
+        let on = liveCheckbox.state == .on
+        liveModePopup.isEnabled = on
+        settingsDelegate?.settingsDidToggleLiveTranscription(on)
+    }
+
+    @objc private func liveModeChanged() {
+        let mode: LiveMode = liveModePopup.indexOfSelectedItem == 1 ? .word : .sentence
+        settingsDelegate?.settingsDidChangeLiveMode(mode)
     }
 
     private func makeTab(title: String, tag: Int) -> NSTabViewItem {
@@ -371,6 +498,14 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
 
     func controlTextDidEndEditing(_ obj: Notification) {
         guard let textField = obj.object as? NSTextField else { return }
+
+        // The Settings language field is not a table cell — handle it separately.
+        if textField === languageField {
+            let text = textField.stringValue.trimmingCharacters(in: .whitespaces)
+            settingsDelegate?.settingsDidChangeLanguage(text.isEmpty ? nil : text)
+            return
+        }
+
         guard let cellView = textField.superview as? NSTableCellView else { return }
 
         // Find which table this belongs to

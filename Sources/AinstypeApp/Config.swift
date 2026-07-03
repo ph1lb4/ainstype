@@ -10,13 +10,24 @@ struct TranscriptionConfig {
     var model: String = "openai_whisper-large-v3-v20240930_turbo_632MB"
 }
 
+/// Granularity at which live transcription commits text to the focused app.
+/// `sentence` waits for a whole segment/phrase (smoother, appears in natural
+/// chunks); `word` commits each word as it's confirmed (snappier first output,
+/// but types in rapid bursts).
+enum LiveMode: String {
+    case sentence
+    case word
+}
+
 struct Config {
     var language: String? = nil
     var autoPaste: Bool = true
     var verbose: Bool = false
-    /// When true, paste confirmed text incrementally while recording (live mode)
-    /// instead of pasting everything once on hotkey release. On by default.
+    /// When true, insert confirmed text incrementally while recording (live mode)
+    /// instead of inserting everything once on hotkey release. On by default.
     var liveTranscription: Bool = true
+    /// Granularity of live insertion. Defaults to sentence (smoother).
+    var liveMode: LiveMode = .sentence
     var recording: RecordingConfig = RecordingConfig()
     var transcription: TranscriptionConfig = TranscriptionConfig()
 
@@ -72,10 +83,11 @@ struct Config {
     mutating func applyTOML(_ tomlString: String) {
         guard let table = try? TOMLTable(string: tomlString) else { return }
 
-        if let language = table["language"]?.string { self.language = language }
+        if let language = table["language"]?.string { self.language = language.isEmpty ? nil : language }
         if let autoPaste = table["auto_paste"]?.bool { self.autoPaste = autoPaste }
         if let verbose = table["verbose"]?.bool { self.verbose = verbose }
         if let live = table["live_transcription"]?.bool { self.liveTranscription = live }
+        if let mode = table["live_mode"]?.string, let parsed = LiveMode(rawValue: mode) { self.liveMode = parsed }
 
         if let rec = table["recording"]?.table {
             if let hotkey = rec["hotkey"]?.string { self.recording.hotkey = hotkey }

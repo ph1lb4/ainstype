@@ -303,20 +303,16 @@ final class LiveSession {
         return emit(remaining.map { $0.text }.joined())
     }
 
-    /// The smallest text units we can confirm independently, each tagged with the
-    /// audio time it ends at: individual words when the model returns word-level
-    /// timestamps, otherwise whole segments.
-    ///
-    /// Words are strongly preferred. Confirming per word lets text surface mid-
-    /// sentence instead of stalling until Whisper closes a segment at a pause
-    /// (which is what made the first output take 10s+ during continuous speech).
-    /// Their `end` timestamps are also precise, so clipping the next decode there
-    /// excludes the confirmed word's audio — segment `end` is coarse enough that
-    /// the boundary word's audio leaked into the next pass and was emitted twice.
+    /// The text units we can confirm independently, each tagged with the audio
+    /// time it ends at. In `.sentence` mode (the default) each whole segment is
+    /// one unit, so text lands in natural phrase-sized chunks. In `.word` mode
+    /// each word is a unit (when the model returns word-level timestamps), so
+    /// text surfaces mid-sentence without waiting for Whisper to close a segment
+    /// at a pause — snappier, but it commits in rapid word bursts.
     private struct Unit { let text: String; let end: Float }
     private func confirmableUnits(_ segments: [TranscriptionSegment]) -> [Unit] {
         segments.flatMap { segment -> [Unit] in
-            if let words = segment.words, !words.isEmpty {
+            if config.liveMode == .word, let words = segment.words, !words.isEmpty {
                 return words.map { Unit(text: $0.word, end: $0.end) }
             }
             return [Unit(text: segment.text, end: segment.end)]
@@ -327,9 +323,9 @@ final class LiveSession {
         var options = DecodingOptions(language: config.language, temperature: 0)
         // Decode clean word text (no <|...|> special/timestamp tokens in segment text).
         options.skipSpecialTokens = true
-        // Ask for word-level timestamps so we can confirm word-by-word; the model
-        // falls back to segment-level in `confirmableUnits` if it returns none.
-        options.wordTimestamps = true
+        // Word-level timestamps are only needed (and only worth their extra
+        // compute) when confirming word-by-word.
+        options.wordTimestamps = config.liveMode == .word
         // Only decode audio after the last confirmed point; segment and word
         // timestamps remain absolute from the start of `samples`.
         options.clipTimestamps = [lastConfirmedEnd]

@@ -58,6 +58,11 @@ class StatusMenuController {
         menu.addItem(statusMenuItem)
         menu.addItem(.separator())
 
+        // Settings
+        let settingsItem = NSMenuItem(title: "Settings\u{2026}", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
         // Dictionary
         let dictItem = NSMenuItem(title: "Dictionary\u{2026}", action: #selector(openDictionary), keyEquivalent: "")
         dictItem.target = self
@@ -448,14 +453,15 @@ class StatusMenuController {
     }
 
     @objc private func toggleLiveTranscription() {
-        config.liveTranscription.toggle()
-        liveTranscriptionItem.state = config.liveTranscription ? .on : .off
-        config.saveUserConfig(key: "live_transcription", value: config.liveTranscription)
-        pipeline.log("Live transcription \(config.liveTranscription ? "enabled" : "disabled")")
+        settingsDidToggleLiveTranscription(!config.liveTranscription)
+    }
+
+    @objc private func openSettings() {
+        ensureDictionaryWindow().showWindow(selectTab: DictionaryWindowController.settingsTabIndex)
     }
 
     @objc private func openDictionary() {
-        ensureDictionaryWindow().showWindow()
+        ensureDictionaryWindow().showWindow(selectTab: DictionaryWindowController.wordsTabIndex)
     }
 
     @objc private func openHistory() {
@@ -464,10 +470,12 @@ class StatusMenuController {
 
     private func ensureDictionaryWindow() -> DictionaryWindowController {
         if dictionaryWindowController == nil {
-            dictionaryWindowController = DictionaryWindowController(
+            let controller = DictionaryWindowController(
                 dictionary: pipeline.dictionary,
                 history: pipeline.history
             )
+            controller.settingsDelegate = self
+            dictionaryWindowController = controller
         }
         return dictionaryWindowController!
     }
@@ -539,5 +547,42 @@ class StatusMenuController {
         } catch {
             Logger.error("Failed to deliver notification: \(error)")
         }
+    }
+}
+
+// MARK: - SettingsDelegate
+
+extension StatusMenuController: SettingsDelegate {
+    func settingsCurrentConfig() -> Config { config }
+
+    func settingsDidChangeHotkey(_ key: String) {
+        guard HotkeyMonitor.supportedKeys.contains(key), key != config.recording.hotkey else { return }
+        hotkeyMonitor?.stop()
+        hotkeyMonitor = nil
+        config.recording.hotkey = key
+        config.saveUserConfig(key: "recording.hotkey", value: key)
+        startHotkeyMonitor()
+        pipeline.log("Hotkey changed to \(key)")
+    }
+
+    func settingsDidChangeLanguage(_ language: String?) {
+        guard language != config.language else { return }
+        config.language = language
+        config.saveUserConfig(key: "language", value: language ?? "")
+        pipeline.log("Language set to \(language ?? "auto-detect")")
+    }
+
+    func settingsDidToggleLiveTranscription(_ enabled: Bool) {
+        config.liveTranscription = enabled
+        liveTranscriptionItem.state = enabled ? .on : .off
+        config.saveUserConfig(key: "live_transcription", value: enabled)
+        pipeline.log("Live transcription \(enabled ? "enabled" : "disabled")")
+    }
+
+    func settingsDidChangeLiveMode(_ mode: LiveMode) {
+        guard mode != config.liveMode else { return }
+        config.liveMode = mode
+        config.saveUserConfig(key: "live_mode", value: mode.rawValue)
+        pipeline.log("Live mode set to \(mode.rawValue)")
     }
 }
