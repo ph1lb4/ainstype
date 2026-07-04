@@ -1,4 +1,81 @@
+import Accelerate
 import AVFoundation
+
+/// Energy gate deciding whether captured audio is worth sending to Whisper.
+/// Whisper hallucinates text ("Thank you.", "you", …) on silence and near-silence,
+/// so buffers with no plausible speech energy are dropped before transcription.
+enum AudioGate {
+    /// Buffers shorter than this can't contain a word — treat as accidental taps.
+    static let minimumDuration: Float = 0.3
+    /// Peak amplitude below this (~-42 dBFS) is considered silence. Chosen well
+    /// under quiet speech (peaks ≳ 0.02) but above a muted/idle mic noise floor.
+    static let silencePeak: Float = 0.0075
+
+    static func shouldTranscribe(_ samples: [Float], sampleRate: Float) -> Bool {
+        guard Float(samples.count) >= minimumDuration * sampleRate else { return false }
+        var peak: Float = 0
+        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
+        return peak >= silencePeak
+    }
+}
+
+/// Converts microphone tap buffers to the 16kHz mono Float32 format Whisper
+/// expects. Wraps AVAudioConverter for testability.
+final class TapConverter {
+    private let converter: AVAudioConverter?
+    private let targetFormat: AVAudioFormat
+    private let ratio: Double
+
+    /// Fails (nil) if the formats differ and no converter can be built — the
+    /// caller should abort recording rather than capture wrong-rate audio.
+    init?(from inputFormat: AVAudioFormat, to targetFormat: AVAudioFormat) {
+        self.targetFormat = targetFormat
+        self.ratio = targetFormat.sampleRate / inputFormat.sampleRate
+        if inputFormat.sampleRate != targetFormat.sampleRate || inputFormat.channelCount != targetFormat.channelCount {
+            guard let c = AVAudioConverter(from: inputFormat, to: targetFormat) else { return nil }
+            self.converter = c
+        } else {
+            self.converter = nil
+        }
+    }
+
+    /// Convert one tap buffer; returns nil on conversion failure.
+    func convert(_ buffer: AVAudioPCMBuffer) -> [Float]? {
+        let outputBuffer: AVAudioPCMBuffer
+        if let converter {
+            let outputFrameCount = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
+            guard let converted = AVAudioPCMBuffer(
+                pcmFormat: targetFormat,
+                frameCapacity: outputFrameCount
+            ) else { return nil }
+
+            // The converter may call the input block several times per convert()
+            // to fill the output buffer (resampler priming). Hand the buffer over
+            // exactly once — returning it again would duplicate captured audio.
+            var consumed = false
+            var error: NSError?
+            converter.convert(to: converted, error: &error) { _, outStatus in
+                if consumed {
+                    outStatus.pointee = .noDataNow
+                    return nil
+                }
+                consumed = true
+                outStatus.pointee = .haveData
+                return buffer
+            }
+            if error != nil { return nil }
+            outputBuffer = converted
+        } else {
+            outputBuffer = buffer
+        }
+
+        guard let channelData = outputBuffer.floatChannelData else { return nil }
+        return Array(UnsafeBufferPointer(
+            start: channelData[0],
+            count: Int(outputBuffer.frameLength)
+        ))
+    }
+}
 
 /// Records audio from the default microphone using AVAudioEngine.
 /// Output: 16kHz mono Float32 array (what Whisper expects).
@@ -56,47 +133,18 @@ class AudioRecorder {
             sampleRate: sampleRate,
             channels: 1,
             interleaved: false
-        ) else {
+        ), let tapConverter = TapConverter(from: inputFormat, to: targetFormat) else {
+            // Roll back so a format failure doesn't leave us wedged, and abort
+            // rather than capture wrong-rate audio Whisper can't use.
+            self.engine = nil
+            lock.lock()
+            isRecording = false
+            lock.unlock()
             throw RecorderError.formatError
         }
 
-        // Install converter if sample rates differ
-        let converter: AVAudioConverter?
-        if inputFormat.sampleRate != sampleRate || inputFormat.channelCount != 1 {
-            converter = AVAudioConverter(from: inputFormat, to: targetFormat)
-        } else {
-            converter = nil
-        }
-
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            guard let self else { return }
-
-            let outputBuffer: AVAudioPCMBuffer
-            if let converter {
-                let ratio = self.sampleRate / inputFormat.sampleRate
-                let outputFrameCount = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
-                guard let converted = AVAudioPCMBuffer(
-                    pcmFormat: targetFormat,
-                    frameCapacity: outputFrameCount
-                ) else { return }
-
-                var error: NSError?
-                converter.convert(to: converted, error: &error) { _, outStatus in
-                    outStatus.pointee = .haveData
-                    return buffer
-                }
-                if error != nil { return }
-                outputBuffer = converted
-            } else {
-                outputBuffer = buffer
-            }
-
-            guard let channelData = outputBuffer.floatChannelData else { return }
-            let data = Array(UnsafeBufferPointer(
-                start: channelData[0],
-                count: Int(outputBuffer.frameLength)
-            ))
-
+            guard let self, let data = tapConverter.convert(buffer) else { return }
             self.lock.lock()
             self.frames.append(data)
             self.lock.unlock()

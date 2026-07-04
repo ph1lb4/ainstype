@@ -69,11 +69,12 @@ class Pipeline {
             let phase1Start = CFAbsoluteTimeGetCurrent()
             log("Phase 1: GPU-only model load...")
 
+            // WhisperKit 1.0 removed the separate prefill model (and its
+            // prefillCompute option).
             let gpuOptions = ModelComputeOptions(
                 melCompute: .cpuAndGPU,
                 audioEncoderCompute: .cpuAndGPU,
-                textDecoderCompute: .cpuAndGPU,
-                prefillCompute: .cpuOnly
+                textDecoderCompute: .cpuAndGPU
             )
 
             // Split prewarm and loadModels so the caller's prewarmHook can run
@@ -191,10 +192,14 @@ class Pipeline {
             throw PipelineError.modelNotReady
         }
 
-        let options = DecodingOptions(
-            language: config.language,
-            temperature: 0
-        )
+        // Whisper hallucinates on silence — don't paste "Thank you." for a
+        // stray hotkey tap.
+        guard AudioGate.shouldTranscribe(audio, sampleRate: Float(config.recording.sampleRate)) else {
+            log("Silence gate: no speech energy in \(audio.count) samples, skipping")
+            return
+        }
+
+        let options = Pipeline.makeDecodingOptions(language: config.language)
 
         log("Transcribing \(audio.count) samples...")
         let results = try await wk.transcribe(audioArray: audio, decodeOptions: options)
@@ -231,6 +236,22 @@ class Pipeline {
         LiveSession(pipeline: self, config: config)
     }
 
+    /// Base decoding options shared by batch and live transcription. When no
+    /// language is configured, language detection must be requested explicitly:
+    /// WhisperKit's prefill otherwise silently falls back to English.
+    ///
+    /// NOTE: dictionary-term biasing via `options.promptTokens` is deliberately
+    /// NOT wired up. WhisperKit's decoder emits an empty transcription whenever
+    /// promptTokens is set (any content, any language setting — reproduced with
+    /// synthesized speech that decodes perfectly without a prompt). Verified
+    /// broken in 0.17.0, 0.18.0 AND 1.0.0, so the initial-prompt feature is
+    /// blocked until fixed upstream.
+    static func makeDecodingOptions(language: String?) -> DecodingOptions {
+        var options = DecodingOptions(language: language, temperature: 0)
+        options.detectLanguage = (language == nil)
+        return options
+    }
+
     enum PipelineError: Error, LocalizedError {
         case modelNotReady
         case downloadStalled
@@ -254,7 +275,8 @@ class Pipeline {
 final class LiveSession {
     private let pipeline: Pipeline
     private let config: Config
-    private let sampleRate: Float = 16000
+    private let sampleRate: Float
+    private let assembler: LiveTextAssembler
     /// Audio newer than this many seconds (from the end of the buffer) is left
     /// unconfirmed, since Whisper may still revise the most recent words. Kept
     /// small: with word-level confirmation this is the main knob on how quickly
@@ -262,23 +284,23 @@ final class LiveSession {
     private let confirmationMargin: Float = 1.0
 
     private var lastConfirmedEnd: Float = 0
-    private var hasEmitted = false
-    /// The last word emitted (normalized), used to drop an accidental repeat when
-    /// a decode boundary re-transcribes the word it was clipped on.
-    private var lastWord = ""
+
     /// Full text emitted so far this session (confirmed chunks + final tail),
     /// for recovery via the history window if inserting failed.
-    private(set) var transcript = ""
+    var transcript: String { assembler.transcript }
 
     init(pipeline: Pipeline, config: Config) {
         self.pipeline = pipeline
         self.config = config
+        self.sampleRate = Float(config.recording.sampleRate)
+        self.assembler = LiveTextAssembler(dictionary: pipeline.dictionary)
     }
 
     /// Transcribe the accumulated buffer and return newly-confirmed text
     /// (dictionary replacements applied), or nil if nothing was newly confirmed.
     func ingest(_ samples: [Float]) async throws -> String? {
         guard let wk = pipeline.whisperKitBox.withLock({ $0 }) else { return nil }
+        guard AudioGate.shouldTranscribe(samples, sampleRate: sampleRate) else { return nil }
 
         // Confirm only audio older than the margin; need new confirmable audio first.
         let totalSeconds = Float(samples.count) / sampleRate
@@ -290,17 +312,27 @@ final class LiveSession {
         guard let last = newlyConfirmed.last else { return nil }
         lastConfirmedEnd = last.end
 
-        return emit(newlyConfirmed.map { $0.text }.joined())
+        return assembler.assemble(newlyConfirmed.map { $0.text }.joined())
     }
 
     /// Final pass after recording stops: emit everything remaining after the last
-    /// confirmed point (the unconfirmed tail).
+    /// confirmed point (the unconfirmed tail), plus any held-back words.
     func finish(_ samples: [Float]) async throws -> String? {
-        guard let wk = pipeline.whisperKitBox.withLock({ $0 }) else { return nil }
+        guard let wk = pipeline.whisperKitBox.withLock({ $0 }),
+              AudioGate.shouldTranscribe(samples, sampleRate: sampleRate)
+        else {
+            Logger.log("Live finish: skipping final decode (model unavailable or silence gate)")
+            return assembler.flushPending()
+        }
         let units = confirmableUnits(try await transcribe(samples, using: wk))
         let remaining = units.filter { $0.end > lastConfirmedEnd }
-        guard !remaining.isEmpty else { return nil }
-        return emit(remaining.map { $0.text }.joined())
+        return assembler.assemble(remaining.map { $0.text }.joined(), flush: true)
+    }
+
+    /// Recover text held back for a possible cross-chunk replacement when the
+    /// final pass failed — held words must not be silently dropped.
+    func flushPending() -> String? {
+        assembler.flushPending()
     }
 
     /// The text units we can confirm independently, each tagged with the audio
@@ -320,7 +352,7 @@ final class LiveSession {
     }
 
     private func transcribe(_ samples: [Float], using wk: WhisperKit) async throws -> [TranscriptionSegment] {
-        var options = DecodingOptions(language: config.language, temperature: 0)
+        var options = Pipeline.makeDecodingOptions(language: config.language)
         // Decode clean word text (no <|...|> special/timestamp tokens in segment text).
         options.skipSpecialTokens = true
         // Word-level timestamps are only needed (and only worth their extra
@@ -333,29 +365,72 @@ final class LiveSession {
         return results.flatMap { $0.segments }
     }
 
+}
+
+/// Turns newly-confirmed raw Whisper text into the exact string to type,
+/// independent of audio state so it can be unit tested. Handles: dropping the
+/// first chunk's leading space, dropping a decode-boundary duplicate word,
+/// holding back trailing words that may start a multi-word replacement phrase,
+/// applying dictionary replacements, and accumulating the session transcript.
+final class LiveTextAssembler {
+    private let dictionary: DictionaryManager
+    private var hasEmitted = false
+    /// The last confirmed word (normalized), used to drop an accidental repeat
+    /// when a decode boundary re-transcribes the word it was clipped on (the
+    /// `correctlycorrectly` / `whichwhich` artifact).
+    private var lastWord = ""
+    /// Confirmed text withheld from emission because it could be the start of a
+    /// multi-word replacement phrase; prepended to the next chunk.
+    private var pendingHold = ""
+    /// Full text emitted so far (confirmed chunks + final tail), for recovery
+    /// via the history window if inserting failed.
+    private(set) var transcript = ""
+
+    init(dictionary: DictionaryManager) {
+        self.dictionary = dictionary
+    }
+
     /// Prepare a newly-confirmed chunk for insertion. Whisper prefixes each word/
     /// segment with a leading space, which naturally separates chunks once they
     /// are typed (typed spaces, unlike pasted edge whitespace, are never trimmed
-    /// by the target field). The very first chunk's leading space is dropped so
-    /// text doesn't start with a space. A leading word that merely repeats the
-    /// last word already emitted is dropped — that happens when the previous
-    /// decode was clipped a hair inside the boundary word and this pass re-
-    /// transcribes it (the `correctlycorrectly` / `whichwhich` artifact). Returns
-    /// nil if nothing is left to emit.
-    private func emit(_ raw: String) -> String? {
+    /// by the target field); the very first output's leading space is dropped so
+    /// text doesn't start with a space. Returns nil if nothing is left to emit.
+    /// With `flush`, held-back text is emitted too — used for the final tail
+    /// when recording stops.
+    func assemble(_ raw: String, flush: Bool = false) -> String? {
         var text = raw
-        if !hasEmitted {
+        if !hasEmitted && pendingHold.isEmpty {
             text = String(text.drop { $0 == " " })
         }
         text = dropDuplicateLeadingWord(text)
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        hasEmitted = true
-        if let last = text.split(separator: " ").last {
+
+        let hasNewText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // Nothing new and nothing to flush: leave any held text in place.
+        if !hasNewText && !flush { return nil }
+
+        if hasNewText, let last = text.split(separator: " ").last {
             lastWord = Self.normalizeWord(String(last))
         }
-        let replaced = pipeline.dictionary.applyReplacements(text)
+
+        var out = pendingHold + (hasNewText ? text : "")
+        pendingHold = ""
+        if !flush {
+            let (emit, hold) = dictionary.holdbackSplit(out)
+            pendingHold = hold
+            out = emit
+        }
+        guard !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+
+        hasEmitted = true
+        let replaced = dictionary.applyReplacements(out)
         transcript += replaced
         return replaced
+    }
+
+    /// Emit whatever is held back without new input — used when a session ends
+    /// on an error path so held words are not silently dropped.
+    func flushPending() -> String? {
+        assemble("", flush: true)
     }
 
     /// If `text`'s first word repeats `lastWord`, remove it (keeping the space

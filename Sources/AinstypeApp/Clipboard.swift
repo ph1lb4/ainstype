@@ -1,6 +1,42 @@
 import AppKit
 import CoreGraphics
 import ApplicationServices
+import os
+
+/// Bookkeeping for restoring the user's clipboard after synthetic pastes.
+/// Restores are delayed (see `Clipboard.restoreDelay`), so two dictations in
+/// quick succession overlap: the second paste sees *our* transcription as the
+/// "previous" clipboard, and the first restore could fire mid-paste. The ledger
+/// keeps the original user clipboard across overlapping pastes and only lets
+/// the latest paste's timer restore it.
+struct RestoreLedger {
+    private(set) var generation = 0
+    private var hasPending = false
+    private var pendingValue: String?
+
+    /// Record a paste about to happen; `previousClipboard` is what the
+    /// clipboard held just before. Returns a generation token for `takeRestore`.
+    /// While a restore is pending, the clipboard holds *our* transcription, so
+    /// only the first overlapping paste captures the user's real clipboard.
+    mutating func recordPaste(previousClipboard: String?) -> Int {
+        if !hasPending {
+            hasPending = true
+            pendingValue = previousClipboard
+        }
+        generation += 1
+        return generation
+    }
+
+    /// The value the timer for paste `generation` should restore, or nil to do
+    /// nothing (superseded by a newer paste, nothing pending, or the original
+    /// clipboard was empty).
+    mutating func takeRestore(for generation: Int) -> String? {
+        guard generation == self.generation, hasPending else { return nil }
+        hasPending = false
+        defer { pendingValue = nil }
+        return pendingValue
+    }
+}
 
 enum Clipboard {
     /// Virtual keycode for the V key (Cmd+V paste).
@@ -47,6 +83,8 @@ enum Clipboard {
         return true
     }
 
+    private static let restoreLedger = OSAllocatedUnfairLock(initialState: RestoreLedger())
+
     /// Copy text to clipboard, simulate Cmd+V paste, then restore previous clipboard.
     static func pasteToFocusedApp(_ text: String) -> Bool {
         let previous = read()
@@ -54,10 +92,13 @@ enum Clipboard {
 
         guard postPasteEvent() else { return false }
 
-        // Restore previous clipboard after the paste has had time to land.
-        if let previous {
-            DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
-                copy(previous)
+        // Restore the user's clipboard after the paste has had time to land.
+        // The ledger keeps the original value across rapid overlapping pastes
+        // and lets only the newest paste's timer restore it.
+        let generation = restoreLedger.withLock { $0.recordPaste(previousClipboard: previous) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
+            if let value = restoreLedger.withLock({ $0.takeRestore(for: generation) }) {
+                copy(value)
             }
         }
 

@@ -11,21 +11,18 @@ protocol SettingsDelegate: AnyObject {
     func settingsDidChangeLiveMode(_ mode: LiveMode)
 }
 
-/// Manages the app window: a Settings tab plus the dictionary (terms and
-/// replacements) and transcription history.
+/// Manages the app window: a Settings tab, the dictionary replacements, and the
+/// transcription history. (The former Words/Names tabs were removed together
+/// with Whisper prompt biasing — see DictionaryManager.)
 class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private var window: NSWindow?
     private let dictionary: DictionaryManager
     private let history: TranscriptionHistory
     weak var settingsDelegate: SettingsDelegate?
 
-    private var words: [String] = []
-    private var names: [String] = []
     private var replacementKeys: [String] = []
     private var replacementValues: [String] = []
 
-    private var wordsTable: NSTableView!
-    private var namesTable: NSTableView!
     private var replacementsTable: NSTableView!
     private var tabView: NSTabView!
     private var historyTextView: NSTextView!
@@ -46,11 +43,11 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         ("ctrl", "Left Control (⌃)"),
     ]
 
-    /// Tab indices, for `showWindow(selectTab:)`. Order: Settings, Words, Names,
+    /// Tab indices, for `showWindow(selectTab:)`. Order: Settings,
     /// Replacements, History.
     static let settingsTabIndex = 0
-    static let wordsTabIndex = 1
-    static let historyTabIndex = 4
+    static let replacementsTabIndex = 1
+    static let historyTabIndex = 2
 
     init(dictionary: DictionaryManager, history: TranscriptionHistory) {
         self.dictionary = dictionary
@@ -63,8 +60,6 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
             buildWindow()
         }
         loadData()
-        wordsTable.reloadData()
-        namesTable.reloadData()
         replacementsTable.reloadData()
         loadHistory()
         populateSettings()
@@ -90,16 +85,12 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     }
 
     private func loadData() {
-        words = dictionary.words
-        names = dictionary.names
         let reps = dictionary.allReplacements
         replacementKeys = reps.keys.sorted()
         replacementValues = replacementKeys.map { reps[$0]! }
     }
 
     private func persist() {
-        dictionary.setWords(words)
-        dictionary.setNames(names)
         var reps: [String: String] = [:]
         for i in 0..<replacementKeys.count {
             let key = replacementKeys[i]
@@ -129,9 +120,7 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         tabView.translatesAutoresizingMaskIntoConstraints = false
 
         tabView.addTabViewItem(makeSettingsTab())
-        tabView.addTabViewItem(makeTab(title: "Words", tag: 0))
-        tabView.addTabViewItem(makeTab(title: "Names", tag: 1))
-        tabView.addTabViewItem(makeTab(title: "Replacements", tag: 2))
+        tabView.addTabViewItem(makeReplacementsTab())
         tabView.addTabViewItem(makeHistoryTab())
         self.tabView = tabView
 
@@ -239,9 +228,11 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         settingsDelegate?.settingsDidChangeLiveMode(mode)
     }
 
-    private func makeTab(title: String, tag: Int) -> NSTabViewItem {
+    // MARK: - Replacements Tab
+
+    private func makeReplacementsTab() -> NSTabViewItem {
         let item = NSTabViewItem()
-        item.label = title
+        item.label = "Replacements"
 
         let container = NSView()
 
@@ -251,46 +242,32 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         scrollView.borderType = .bezelBorder
 
         let table = NSTableView()
-        table.tag = tag
         table.dataSource = self
         table.delegate = self
         table.usesAlternatingRowBackgroundColors = true
         table.allowsMultipleSelection = false
-        table.headerView = nil
 
-        if tag == 2 {
-            // Replacements: two columns
-            let spokenCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("spoken"))
-            spokenCol.title = "Spoken Phrase"
-            spokenCol.minWidth = 120
-            table.addTableColumn(spokenCol)
+        let spokenCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("spoken"))
+        spokenCol.title = "Spoken Phrase"
+        spokenCol.minWidth = 120
+        table.addTableColumn(spokenCol)
 
-            let writtenCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("written"))
-            writtenCol.title = "Written Text"
-            writtenCol.minWidth = 120
-            table.addTableColumn(writtenCol)
+        let writtenCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("written"))
+        writtenCol.title = "Written Text"
+        writtenCol.minWidth = 120
+        table.addTableColumn(writtenCol)
 
-            table.headerView = NSTableHeaderView()
-            replacementsTable = table
-        } else {
-            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("value"))
-            col.title = title
-            table.addTableColumn(col)
-
-            if tag == 0 { wordsTable = table }
-            else { namesTable = table }
-        }
+        table.headerView = NSTableHeaderView()
+        replacementsTable = table
 
         scrollView.documentView = table
 
-        let addButton = NSButton(title: "+", target: self, action: #selector(addRow(_:)))
-        addButton.tag = tag
+        let addButton = NSButton(title: "+", target: self, action: #selector(addRow))
         addButton.translatesAutoresizingMaskIntoConstraints = false
         addButton.bezelStyle = .smallSquare
         addButton.setContentHuggingPriority(.required, for: .horizontal)
 
-        let removeButton = NSButton(title: "\u{2212}", target: self, action: #selector(removeRow(_:)))
-        removeButton.tag = tag
+        let removeButton = NSButton(title: "\u{2212}", target: self, action: #selector(removeRow))
         removeButton.translatesAutoresizingMaskIntoConstraints = false
         removeButton.bezelStyle = .smallSquare
         removeButton.setContentHuggingPriority(.required, for: .horizontal)
@@ -373,58 +350,22 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
 
     // MARK: - Actions
 
-    @objc private func addRow(_ sender: NSButton) {
-        let tag = sender.tag
-        switch tag {
-        case 0:
-            words.append("")
-            wordsTable.reloadData()
-            let row = words.count - 1
-            wordsTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            editCell(table: wordsTable, row: row, column: 0)
-        case 1:
-            names.append("")
-            namesTable.reloadData()
-            let row = names.count - 1
-            namesTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            editCell(table: namesTable, row: row, column: 0)
-        case 2:
-            replacementKeys.append("")
-            replacementValues.append("")
-            replacementsTable.reloadData()
-            let row = replacementKeys.count - 1
-            replacementsTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            editCell(table: replacementsTable, row: row, column: 0)
-        default:
-            break
-        }
+    @objc private func addRow() {
+        replacementKeys.append("")
+        replacementValues.append("")
+        replacementsTable.reloadData()
+        let row = replacementKeys.count - 1
+        replacementsTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        editCell(table: replacementsTable, row: row, column: 0)
     }
 
-    @objc private func removeRow(_ sender: NSButton) {
-        let tag = sender.tag
-        switch tag {
-        case 0:
-            let row = wordsTable.selectedRow
-            guard row >= 0 else { return }
-            words.remove(at: row)
-            wordsTable.reloadData()
-            persist()
-        case 1:
-            let row = namesTable.selectedRow
-            guard row >= 0 else { return }
-            names.remove(at: row)
-            namesTable.reloadData()
-            persist()
-        case 2:
-            let row = replacementsTable.selectedRow
-            guard row >= 0 else { return }
-            replacementKeys.remove(at: row)
-            replacementValues.remove(at: row)
-            replacementsTable.reloadData()
-            persist()
-        default:
-            break
-        }
+    @objc private func removeRow() {
+        let row = replacementsTable.selectedRow
+        guard row >= 0 else { return }
+        replacementKeys.remove(at: row)
+        replacementValues.remove(at: row)
+        replacementsTable.reloadData()
+        persist()
     }
 
     private func editCell(table: NSTableView, row: Int, column: Int) {
@@ -439,18 +380,13 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     // MARK: - NSTableViewDataSource
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        switch tableView.tag {
-        case 0: return words.count
-        case 1: return names.count
-        case 2: return replacementKeys.count
-        default: return 0
-        }
+        replacementKeys.count
     }
 
     // MARK: - NSTableViewDelegate
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let identifier = tableColumn?.identifier ?? NSUserInterfaceItemIdentifier("value")
+        let identifier = tableColumn?.identifier ?? NSUserInterfaceItemIdentifier("spoken")
         let cellView: NSTableCellView
 
         if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
@@ -473,22 +409,7 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
             ])
         }
 
-        let text: String
-        switch tableView.tag {
-        case 0:
-            text = words[row]
-        case 1:
-            text = names[row]
-        case 2:
-            if identifier.rawValue == "spoken" {
-                text = replacementKeys[row]
-            } else {
-                text = replacementValues[row]
-            }
-        default:
-            text = ""
-        }
-
+        let text = identifier.rawValue == "spoken" ? replacementKeys[row] : replacementValues[row]
         cellView.textField?.stringValue = text
         cellView.textField?.tag = row
         return cellView
@@ -508,35 +429,14 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
 
         guard let cellView = textField.superview as? NSTableCellView else { return }
 
-        // Find which table this belongs to
-        var view: NSView? = cellView
-        while view != nil && !(view is NSTableView) {
-            view = view?.superview
-        }
-        guard let tableView = view as? NSTableView else { return }
-
-        let row = tableView.row(for: cellView)
-        guard row >= 0 else { return }
-        let col = tableView.column(for: cellView)
-        let value = textField.stringValue
-
-        switch tableView.tag {
-        case 0:
-            guard row < words.count else { return }
-            words[row] = value
-        case 1:
-            guard row < names.count else { return }
-            names[row] = value
-        case 2:
-            guard row < replacementKeys.count else { return }
-            let identifier = tableView.tableColumns[col].identifier.rawValue
-            if identifier == "spoken" {
-                replacementKeys[row] = value
-            } else {
-                replacementValues[row] = value
-            }
-        default:
-            break
+        let row = replacementsTable.row(for: cellView)
+        guard row >= 0, row < replacementKeys.count else { return }
+        let col = replacementsTable.column(for: cellView)
+        let identifier = replacementsTable.tableColumns[col].identifier.rawValue
+        if identifier == "spoken" {
+            replacementKeys[row] = textField.stringValue
+        } else {
+            replacementValues[row] = textField.stringValue
         }
 
         persist()
@@ -546,8 +446,6 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
 
     func windowWillClose(_ notification: Notification) {
         // Clean up empty entries on close
-        words.removeAll { $0.isEmpty }
-        names.removeAll { $0.isEmpty }
         for i in stride(from: replacementKeys.count - 1, through: 0, by: -1) {
             if replacementKeys[i].isEmpty && replacementValues[i].isEmpty {
                 replacementKeys.remove(at: i)

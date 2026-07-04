@@ -1,14 +1,27 @@
 import AppKit
 import CoreGraphics
 
-/// macOS virtual keycodes for modifier keys.
-private let keycodeMap: [String: (keyCode: UInt16, modifierFlag: NSEvent.ModifierFlags)] = [
-    "cmd_r": (54, .command),
-    "cmd": (55, .command),
-    "alt_r": (61, .option),
-    "alt": (58, .option),
-    "ctrl_r": (62, .control),
-    "ctrl": (59, .control),
+/// One supported modifier hotkey: its virtual keycode, the generic modifier
+/// flag, and the device-specific NX_DEVICE…MASK bits that distinguish the left
+/// from the right key of the same family in `modifierFlags.rawValue`.
+private struct ModifierKey {
+    let keyCode: UInt16
+    let modifierFlag: NSEvent.ModifierFlags
+    /// Bit identifying exactly this key (e.g. right ⌘) in the raw flags.
+    let deviceMask: UInt
+    /// Both left+right bits of this key's family, to detect whether the event
+    /// carries device-specific information at all.
+    let familyMask: UInt
+}
+
+/// macOS virtual keycodes and NX device masks for modifier keys.
+private let keycodeMap: [String: ModifierKey] = [
+    "cmd_r": ModifierKey(keyCode: 54, modifierFlag: .command, deviceMask: 0x10, familyMask: 0x18),
+    "cmd": ModifierKey(keyCode: 55, modifierFlag: .command, deviceMask: 0x08, familyMask: 0x18),
+    "alt_r": ModifierKey(keyCode: 61, modifierFlag: .option, deviceMask: 0x40, familyMask: 0x60),
+    "alt": ModifierKey(keyCode: 58, modifierFlag: .option, deviceMask: 0x20, familyMask: 0x60),
+    "ctrl_r": ModifierKey(keyCode: 62, modifierFlag: .control, deviceMask: 0x2000, familyMask: 0x2001),
+    "ctrl": ModifierKey(keyCode: 59, modifierFlag: .control, deviceMask: 0x01, familyMask: 0x2001),
 ]
 
 /// Global hotkey monitor using NSEvent for modifier keys (hold-to-record pattern).
@@ -19,7 +32,10 @@ class HotkeyMonitor {
 
     private let targetKeyCode: UInt16
     private let modifierFlag: NSEvent.ModifierFlags
-    private var monitor: Any?
+    private let deviceMask: UInt
+    private let familyMask: UInt
+    private var globalMonitor: Any?
+    private var localMonitor: Any?
     private var pressed = false
     private let lock = NSLock()
 
@@ -36,38 +52,56 @@ class HotkeyMonitor {
         self.keyName = keyName
         self.targetKeyCode = mapping.keyCode
         self.modifierFlag = mapping.modifierFlag
+        self.deviceMask = mapping.deviceMask
+        self.familyMask = mapping.familyMask
         self.onPress = onPress
         self.onRelease = onRelease
     }
 
-    /// Install the global event monitor. Returns true on success.
+    /// Install the event monitors. Returns true on success.
     /// Must be called on the main thread.
+    ///
+    /// Two monitors are needed: the global monitor sees events in all *other*
+    /// apps but explicitly never receives events delivered to this app — so
+    /// without the local monitor the hotkey goes dead whenever an ainstype
+    /// window (Settings, Dictionary) is focused.
     @discardableResult
     func start() -> Bool {
-        if monitor != nil {
+        if globalMonitor != nil {
             Logger.log("HotkeyMonitor already started")
             return true
         }
 
-        monitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             self?.handleEvent(event)
         }
 
-        if monitor == nil {
+        if globalMonitor == nil {
             Logger.error("Failed to create NSEvent monitor — grant Input Monitoring permission")
             return false
+        }
+
+        if localMonitor == nil {
+            localMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+                self?.handleEvent(event)
+                return event
+            }
         }
 
         Logger.log("Hotkey monitor started (key=\(keyName), keycode=\(targetKeyCode))")
         return true
     }
 
-    /// Remove the global event monitor.
+    /// Remove the event monitors.
     func stop() {
-        if let m = monitor {
+        if let m = globalMonitor {
             NSEvent.removeMonitor(m)
-            monitor = nil
+            globalMonitor = nil
             Logger.log("Hotkey monitor stopped")
+        }
+        if let m = localMonitor {
+            NSEvent.removeMonitor(m)
+            localMonitor = nil
         }
     }
 
@@ -78,12 +112,31 @@ class HotkeyMonitor {
         lock.unlock()
     }
 
-    var isActive: Bool { monitor != nil }
+    var isActive: Bool { globalMonitor != nil }
 
     private func handleEvent(_ event: NSEvent) {
-        guard event.keyCode == targetKeyCode else { return }
+        processFlagsChange(keyCode: event.keyCode, rawFlags: event.modifierFlags.rawValue)
+    }
 
-        let isPressed = event.modifierFlags.contains(modifierFlag)
+    /// Core press/release decision, separated from NSEvent so it can be tested
+    /// with simulated flag sequences.
+    ///
+    /// The generic modifier flag (e.g. `.command`) is shared by the left and
+    /// right key of a family, so it stays set when the *other* key is still
+    /// held — releasing right-⌘ while left-⌘ is down would never be detected
+    /// and recording would run until the safety timer. Prefer the
+    /// device-specific bit; fall back to the generic flag only when the event
+    /// carries no device bits at all (some remapping tools synthesize such
+    /// events).
+    func processFlagsChange(keyCode: UInt16, rawFlags: UInt) {
+        guard keyCode == targetKeyCode else { return }
+
+        let isPressed: Bool
+        if rawFlags & familyMask != 0 {
+            isPressed = rawFlags & deviceMask != 0
+        } else {
+            isPressed = NSEvent.ModifierFlags(rawValue: rawFlags).contains(modifierFlag)
+        }
 
         lock.lock()
         let wasPressed = pressed

@@ -11,11 +11,10 @@ A macOS menubar app for speech-to-text. Hold a hotkey, speak, release — your w
 ```bash
 swift build                    # debug build
 swift run                      # run debug build
+swift test                     # unit tests (Tests/AinstypeAppTests)
 swift build -c release         # release build
 ./build_app.sh                 # build .app bundle + sign + DMG + notarize
 ```
-
-There are no tests yet.
 
 ## Architecture
 
@@ -29,7 +28,7 @@ The pipeline flows: **hotkey → record → transcribe → dictionary replacemen
 - `AudioRecorder.swift` — `AVAudioEngine` capture, outputs 16kHz mono Float32 array.
 - `Pipeline.swift` — Orchestrates: WhisperKit transcribe → dictionary replacements → clipboard paste. Two-phase warmUp: fast GPU load (~5-10s), then background ANE specialization.
 - `ModelState.swift` — Persists downloaded model path and ANE specialization state to `~/.config/ainstype/model_state.json`.
-- `Dictionary.swift` — Reads `dictionary.toml`, builds Whisper initial prompt, applies spoken→written replacements.
+- `Dictionary.swift` — Reads `dictionary.toml`, applies spoken→written replacements. (Whisper initial-prompt biasing was removed: WhisperKit 0.17.0–1.0.0 returns empty transcriptions when `promptTokens` is set; the `[terms]` TOML section is preserved on save for the Python CLI.)
 - `Clipboard.swift` — `NSPasteboard` + `CGEvent` Cmd+V paste (no osascript). Requires Accessibility permission.
 - `Config.swift` — TOMLKit-based config, reads `~/.config/ainstype/` files.
 - `LaunchAgent.swift` — Manages `~/Library/LaunchAgents/com.ainstype.menubar.plist` for auto-start at login.
@@ -56,5 +55,5 @@ The app is built and distributed as a signed/notarized `.app` bundle in a DMG.
 ## Key conventions
 
 - Targets macOS 14+ (Sonoma), Apple Silicon only.
-- SPM dependencies: WhisperKit (0.12.0+), TOMLKit (0.6.0+).
+- SPM dependencies: WhisperKit (1.0.0+), TOMLKit (0.6.0+).
 - Two-phase model loading: GPU-first for fast startup (~5-10s), then background ANE specialization for optimal inference.

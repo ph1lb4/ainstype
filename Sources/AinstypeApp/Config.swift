@@ -28,6 +28,11 @@ struct Config {
     var liveTranscription: Bool = true
     /// Granularity of live insertion. Defaults to sentence (smoother).
     var liveMode: LiveMode = .sentence
+
+    /// Whether recording should insert text live (type-as-you-speak). Requires
+    /// both the live toggle and auto-paste: with auto_paste off the user chose
+    /// clipboard-only output, so nothing may be typed into the focused app.
+    var liveInsertionEnabled: Bool { liveTranscription && autoPaste }
     var recording: RecordingConfig = RecordingConfig()
     var transcription: TranscriptionConfig = TranscriptionConfig()
 

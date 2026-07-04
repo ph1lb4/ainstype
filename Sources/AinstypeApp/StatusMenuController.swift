@@ -39,6 +39,10 @@ class StatusMenuController {
     private var liveSession: LiveSession?
     private var liveTask: Task<Void, Never>?
 
+    /// Whether phase-1 model load has completed. Needed so permission warnings
+    /// and the model-loading state don't overwrite each other in the menu bar.
+    private var modelReady = false
+
     init(config: Config, pipeline: Pipeline) {
         self.config = config
         self.pipeline = pipeline
@@ -144,7 +148,14 @@ class StatusMenuController {
                     DispatchQueue.main.async {
                         switch status {
                         case "ready":
-                            self?.updateState(.idle)
+                            self?.modelReady = true
+                            // Don't show "Ready" over an unresolved permission
+                            // warning — the hotkey wouldn't actually work.
+                            if self?.hotkeyMonitor?.isActive == true {
+                                self?.updateState(.idle)
+                            } else {
+                                self?.updateState(.warning("Grant Input Monitoring permission"))
+                            }
                             // Warm CoreAudio so the first hotkey press isn't cold-slow.
                             // The engine is constructed and immediately released inside
                             // prewarm() to avoid keeping the mic AU open.
@@ -243,7 +254,9 @@ class StatusMenuController {
                 self.updateState(.recording)
                 self.startMaxRecordingTimer()
             }
-            if config.liveTranscription {
+            // Live insertion also requires auto-paste: with auto_paste=false the
+            // user chose clipboard-only output, so nothing may be typed.
+            if config.liveInsertionEnabled {
                 startLiveLoop()
             }
         } catch {
@@ -266,7 +279,7 @@ class StatusMenuController {
 
         DispatchQueue.main.async { self.cancelMaxRecordingTimer() }
 
-        if config.liveTranscription, let session = liveSession {
+        if let session = liveSession {
             finishLiveLoop(session)
             return
         }
@@ -334,8 +347,15 @@ class StatusMenuController {
                 if let tail = try await session.finish(audio), !tail.isEmpty {
                     Clipboard.typeText(tail)
                 }
+                // Privacy: log only sizes, never content.
+                Logger.log("Live session done: typed \(session.transcript.count) characters total")
             } catch {
                 Logger.error("Live finish error: \(error)")
+                // The final pass failed, but words held back for a possible
+                // cross-chunk replacement must still come out.
+                if let held = session.flushPending(), !held.isEmpty {
+                    Clipboard.typeText(held)
+                }
             }
             pipeline.history.add(session.transcript.trimmingCharacters(in: .whitespacesAndNewlines))
             self.finishProcessing()
@@ -405,7 +425,11 @@ class StatusMenuController {
             Logger.log("Hotkey monitor not active, attempting restart")
             if monitor.start() {
                 Logger.log("Hotkey monitor recovered")
-                updateState(.idle)
+                // Only clear the permission warning; never clobber
+                // loading/recording/processing/error states.
+                if case .warning = currentState {
+                    updateState(modelReady ? .idle : .loading)
+                }
             }
         }
     }
@@ -461,7 +485,7 @@ class StatusMenuController {
     }
 
     @objc private func openDictionary() {
-        ensureDictionaryWindow().showWindow(selectTab: DictionaryWindowController.wordsTabIndex)
+        ensureDictionaryWindow().showWindow(selectTab: DictionaryWindowController.replacementsTabIndex)
     }
 
     @objc private func openHistory() {
@@ -557,6 +581,9 @@ extension StatusMenuController: SettingsDelegate {
 
     func settingsDidChangeHotkey(_ key: String) {
         guard HotkeyMonitor.supportedKeys.contains(key), key != config.recording.hotkey else { return }
+        // If the old hotkey is physically held right now, its release event will
+        // never arrive once the monitor is swapped — finish that recording first.
+        onHotkeyRelease()
         hotkeyMonitor?.stop()
         hotkeyMonitor = nil
         config.recording.hotkey = key
