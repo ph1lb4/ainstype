@@ -33,6 +33,15 @@ struct Config {
     var liveTranscription: Bool = true
     /// Granularity of live insertion. Defaults to sentence (smoother).
     var liveMode: LiveMode = .sentence
+    /// How long the latest transcription is kept on the clipboard before the
+    /// user's previous clipboard content is restored, in seconds. 0 (the default)
+    /// keeps the old behaviour: the clipboard is restored as soon as the
+    /// automatic paste has landed. Set to 5 or 10 in Settings to always have a
+    /// window in which a manual ⌘V pastes what was just dictated.
+    var clipboardHoldSeconds: Int = 0
+
+    /// `clipboardHoldSeconds` as a duration, clamped to non-negative.
+    var clipboardHoldDuration: TimeInterval { TimeInterval(max(0, clipboardHoldSeconds)) }
 
     /// Whether recording should insert text live (type-as-you-speak). Requires
     /// both the live toggle and auto-paste: with auto_paste off the user chose
@@ -79,7 +88,8 @@ struct Config {
     }
 
     /// Clamp/repair values that would otherwise crash or silently break the app.
-    private mutating func validate() {
+    /// Internal rather than private so tests can exercise the clamping directly.
+    mutating func validate() {
         if !HotkeyMonitor.supportedKeys.contains(recording.hotkey) {
             Logger.error("Invalid hotkey '\(recording.hotkey)' in config — falling back to 'cmd_r'. Supported: \(HotkeyMonitor.supportedKeys.joined(separator: ", "))")
             recording.hotkey = "cmd_r"
@@ -88,7 +98,16 @@ struct Config {
             Logger.error("Invalid sample_rate \(recording.sampleRate) in config — falling back to 16000")
             recording.sampleRate = 16000
         }
+        // A hold longer than this would leave the user's own clipboard replaced
+        // for so long that it reads as a bug rather than a feature.
+        if clipboardHoldSeconds < 0 || clipboardHoldSeconds > Config.maxClipboardHoldSeconds {
+            Logger.error("Invalid clipboard_hold_seconds \(clipboardHoldSeconds) in config — clamping to 0…\(Config.maxClipboardHoldSeconds)")
+            clipboardHoldSeconds = min(max(0, clipboardHoldSeconds), Config.maxClipboardHoldSeconds)
+        }
     }
+
+    /// Upper bound for `clipboardHoldSeconds`.
+    static let maxClipboardHoldSeconds = 60
 
     mutating func applyTOML(_ tomlString: String) {
         guard let table = try? TOMLTable(string: tomlString) else { return }
@@ -98,6 +117,7 @@ struct Config {
         if let verbose = table["verbose"]?.bool { self.verbose = verbose }
         if let live = table["live_transcription"]?.bool { self.liveTranscription = live }
         if let mode = table["live_mode"]?.string, let parsed = LiveMode(rawValue: mode) { self.liveMode = parsed }
+        if let hold = table["clipboard_hold_seconds"]?.int { self.clipboardHoldSeconds = hold }
 
         if let rec = table["recording"]?.table {
             if let hotkey = rec["hotkey"]?.string { self.recording.hotkey = hotkey }
@@ -134,6 +154,11 @@ struct Config {
     /// Save a single boolean key-value pair to the user config file.
     func saveUserConfig(key: String, value: Bool) {
         setUserConfig(key: key, value: TOMLValue(booleanLiteral: value))
+    }
+
+    /// Save a single integer key-value pair to the user config file.
+    func saveUserConfig(key: String, value: Int) {
+        setUserConfig(key: key, value: TOMLValue(integerLiteral: value))
     }
 
     private func setUserConfig(key: String, value: any TOMLValueConvertible) {

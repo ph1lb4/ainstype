@@ -1,5 +1,4 @@
 import AppKit
-import UserNotifications
 
 /// Manages the NSStatusItem, menu, and UI state.
 class StatusMenuController {
@@ -38,6 +37,9 @@ class StatusMenuController {
     // Live (streaming) transcription state
     private var liveSession: LiveSession?
     private var liveTask: Task<Void, Never>?
+    /// Set when a live chunk could not be inserted into the focused app, so the
+    /// whole transcript can be offered for recovery once the session ends.
+    private var liveInsertFailed = false
 
     /// Whether phase-1 model load has completed. Needed so permission warnings
     /// and the model-loading state don't overwrite each other in the menu bar.
@@ -72,6 +74,11 @@ class StatusMenuController {
         dictItem.target = self
         menu.addItem(dictItem)
 
+        // Copy the latest transcription (recover text if pasting failed)
+        let copyLatestItem = NSMenuItem(title: "Copy Latest", action: #selector(copyLatest), keyEquivalent: "")
+        copyLatestItem.target = self
+        menu.addItem(copyLatestItem)
+
         // Recent transcriptions (recover text if pasting failed)
         let historyItem = NSMenuItem(title: "Recent Transcriptions\u{2026}", action: #selector(openHistory), keyEquivalent: "")
         historyItem.target = self
@@ -105,9 +112,6 @@ class StatusMenuController {
         // Create recorder
         recorder = AudioRecorder(sampleRate: config.recording.sampleRate)
         recorder.inputDevice = InputDeviceSelection(configValue: config.recording.inputDevice)
-
-        // Ask for permission to post our error/empty-recording notifications.
-        requestNotificationAuthorization()
 
         // Start hotkey monitor
         startHotkeyMonitor()
@@ -265,10 +269,10 @@ class StatusMenuController {
             lock.lock()
             isRecording = false
             lock.unlock()
-            Task { await self.showNotification(
-                title: "ainstype",
-                body: "Couldn't start recording. Check microphone access in System Settings → Privacy & Security."
-            ) }
+            RecoveryBubble.present(
+                title: "Couldn\u{2019}t start recording",
+                message: "Check microphone access in System Settings \u{2192} Privacy & Security \u{2192} Microphone."
+            )
         }
     }
 
@@ -292,14 +296,17 @@ class StatusMenuController {
             do {
                 if audio.isEmpty {
                     Logger.log("Empty audio buffer")
-                    await showNotification(title: "ainstype", body: "Recording was empty — nothing was captured. Check microphone access.")
+                    RecoveryBubble.present(
+                        title: "Nothing was recorded",
+                        message: "No audio was captured. Check microphone access and the selected input device."
+                    )
                 } else {
                     try await pipeline.processAudio(audio, config: config)
                 }
             } catch {
                 Logger.error("Pipeline error: \(error)")
                 let message = (error as? LocalizedError)?.errorDescription ?? "Transcription failed. Please try again."
-                await showNotification(title: "ainstype", body: message)
+                RecoveryBubble.present(title: "Transcription failed", message: message)
             }
             self.finishProcessing()
         }
@@ -311,6 +318,7 @@ class StatusMenuController {
     private func startLiveLoop() {
         let session = pipeline.makeLiveSession(config: config)
         liveSession = session
+        liveInsertFailed = false
 
         liveTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -321,7 +329,11 @@ class StatusMenuController {
                 guard !samples.isEmpty else { continue }
                 do {
                     if let chunk = try await session.ingest(samples), !chunk.isEmpty {
-                        Clipboard.typeText(chunk)
+                        // Report insertion failures once at the end of the
+                        // session with the whole transcript, rather than a
+                        // bubble per chunk: if one chunk can't be inserted, the
+                        // rest of them can't either.
+                        if !Clipboard.typeText(chunk) { self.liveInsertFailed = true }
                     }
                 } catch {
                     Logger.error("Live ingest error: \(error)")
@@ -344,22 +356,61 @@ class StatusMenuController {
             // Wait for any in-flight ingest to finish so the final pass sees the
             // up-to-date confirmed point and we never emit duplicate text.
             await task?.value
+            var finishError: String?
             do {
                 if let tail = try await session.finish(audio), !tail.isEmpty {
-                    Clipboard.typeText(tail)
+                    if !Clipboard.typeText(tail) { liveInsertFailed = true }
                 }
                 // Privacy: log only sizes, never content.
                 Logger.log("Live session done: typed \(session.transcript.count) characters total")
             } catch {
                 Logger.error("Live finish error: \(error)")
+                finishError = (error as? LocalizedError)?.errorDescription
+                    ?? "The final part of the transcription could not be decoded."
                 // The final pass failed, but words held back for a possible
                 // cross-chunk replacement must still come out.
                 if let held = session.flushPending(), !held.isEmpty {
-                    Clipboard.typeText(held)
+                    if !Clipboard.typeText(held) { liveInsertFailed = true }
                 }
             }
-            pipeline.history.add(session.transcript.trimmingCharacters(in: .whitespacesAndNewlines))
+            let transcript = session.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            pipeline.history.add(transcript)
+            reportLiveOutcome(transcript: transcript, finishError: finishError)
             self.finishProcessing()
+        }
+    }
+
+    /// After a live session: surface anything that went wrong in a bubble the
+    /// user can copy from, and apply the clipboard hold to the finished
+    /// transcript so a manual ⌘V works for the configured window.
+    private func reportLiveOutcome(transcript: String, finishError: String?) {
+        if liveInsertFailed {
+            liveInsertFailed = false
+            Clipboard.copyPinned(transcript)
+            RecoveryBubble.present(
+                title: "Couldn\u{2019}t insert text into the app",
+                message: transcript,
+                copyText: transcript.isEmpty ? nil : transcript,
+                note: "It\u{2019}s on your clipboard \u{2014} press \u{2318}V to paste it. Check Accessibility permission in System Settings."
+            )
+            return
+        }
+
+        if let finishError {
+            RecoveryBubble.present(
+                title: "Transcription incomplete",
+                message: finishError,
+                copyText: transcript.isEmpty ? nil : transcript,
+                note: transcript.isEmpty ? nil : "Copy what was transcribed so far."
+            )
+            return
+        }
+
+        // Live mode inserts text directly, so nothing was on the clipboard —
+        // put the finished transcript there for the hold window.
+        let hold = config.clipboardHoldDuration
+        if hold > 0, !transcript.isEmpty {
+            Clipboard.copyAndHold(transcript, for: hold)
         }
     }
 
@@ -489,6 +540,26 @@ class StatusMenuController {
         ensureDictionaryWindow().showWindow(selectTab: DictionaryWindowController.replacementsTabIndex)
     }
 
+    /// Put the most recent transcription back on the clipboard and keep it there,
+    /// for when a paste went to the wrong app (or nowhere at all).
+    @objc private func copyLatest() {
+        guard let latest = pipeline.history.recent().first else {
+            RecoveryBubble.present(
+                title: "Nothing to copy yet",
+                message: "No transcription has been made since ainstype started."
+            )
+            return
+        }
+        Clipboard.copyPinned(latest.text)
+        pipeline.log("Copied latest transcription (\(latest.text.count) characters) to clipboard")
+        RecoveryBubble.present(
+            title: "Latest transcription copied",
+            message: latest.text,
+            note: "Press \u{2318}V to paste it.",
+            style: .info
+        )
+    }
+
     @objc private func openHistory() {
         ensureDictionaryWindow().showWindow(selectTab: DictionaryWindowController.historyTabIndex)
     }
@@ -548,31 +619,6 @@ class StatusMenuController {
         }
     }
 
-    // MARK: - Notifications
-
-    private func requestNotificationAuthorization() {
-        // UNUserNotificationCenter requires a real app bundle; skip under `swift run`.
-        guard Bundle.main.bundleIdentifier != nil else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, error in
-            if let error { Logger.error("Notification authorization failed: \(error)") }
-        }
-    }
-
-    private func showNotification(title: String, body: String) async {
-        guard Bundle.main.bundleIdentifier != nil else {
-            Logger.log("Notification (no bundle): \(title) — \(body)")
-            return
-        }
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        do {
-            try await UNUserNotificationCenter.current().add(request)
-        } catch {
-            Logger.error("Failed to deliver notification: \(error)")
-        }
-    }
 }
 
 // MARK: - SettingsDelegate
@@ -612,6 +658,15 @@ extension StatusMenuController: SettingsDelegate {
         config.liveMode = mode
         config.saveUserConfig(key: "live_mode", value: mode.rawValue)
         pipeline.log("Live mode set to \(mode.rawValue)")
+    }
+
+    func settingsDidChangeClipboardHold(_ seconds: Int) {
+        guard seconds != config.clipboardHoldSeconds else { return }
+        config.clipboardHoldSeconds = seconds
+        config.saveUserConfig(key: "clipboard_hold_seconds", value: seconds)
+        pipeline.log(seconds > 0
+            ? "Clipboard hold set to \(seconds)s"
+            : "Clipboard hold disabled")
     }
 
     func settingsDidChangeInputDevice(_ value: String) {

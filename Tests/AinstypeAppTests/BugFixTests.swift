@@ -359,6 +359,58 @@ final class RestoreLedgerTests: XCTestCase {
         let gen = ledger.recordPaste(previousClipboard: nil)
         XCTAssertNil(ledger.takeRestore(for: gen))
     }
+
+    /// "Copy Latest" / the bubble's Copy button pin text to the clipboard. A
+    /// restore timer already in flight (from the paste that failed, or from a
+    /// clipboard hold) must not fire afterwards and throw that text away.
+    func testCancelPendingNeutralizesInFlightRestore() {
+        var ledger = RestoreLedger()
+        let gen = ledger.recordPaste(previousClipboard: "user data")
+        ledger.cancelPending()
+        XCTAssertNil(ledger.takeRestore(for: gen), "cancelled restore must not fire")
+    }
+
+    /// Cancelling must not wedge the ledger: the next paste still gets its own
+    /// working restore.
+    func testPasteAfterCancelStillRestores() {
+        var ledger = RestoreLedger()
+        _ = ledger.recordPaste(previousClipboard: "user data")
+        ledger.cancelPending()
+        let gen = ledger.recordPaste(previousClipboard: "later clipboard")
+        XCTAssertEqual(ledger.takeRestore(for: gen), "later clipboard")
+    }
+}
+
+// MARK: - Clipboard hold setting
+
+final class ClipboardHoldConfigTests: XCTestCase {
+    /// Off by default: existing users keep the immediate-restore behaviour.
+    func testDefaultsToOff() {
+        XCTAssertEqual(Config().clipboardHoldSeconds, 0)
+        XCTAssertEqual(Config().clipboardHoldDuration, 0)
+    }
+
+    func testParsesConfiguredHold() {
+        var c = Config()
+        c.applyTOML("clipboard_hold_seconds = 10")
+        XCTAssertEqual(c.clipboardHoldSeconds, 10)
+        XCTAssertEqual(c.clipboardHoldDuration, 10)
+    }
+
+    /// A negative hold would mean "restore before the paste lands"; a huge one
+    /// would leave the user's clipboard replaced for minutes. Both get clamped
+    /// by validate(), which load() runs.
+    func testNegativeAndOversizedHoldsAreClamped() {
+        var negative = Config()
+        negative.clipboardHoldSeconds = -5
+        negative.validate()
+        XCTAssertEqual(negative.clipboardHoldSeconds, 0)
+
+        var huge = Config()
+        huge.clipboardHoldSeconds = 10_000
+        huge.validate()
+        XCTAssertEqual(huge.clipboardHoldSeconds, Config.maxClipboardHoldSeconds)
+    }
 }
 
 // MARK: - Decoding options

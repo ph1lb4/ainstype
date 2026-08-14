@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-VERSION="0.5.1"
+VERSION="0.6.0"
 APP_NAME="ainstype"
 BUNDLE_NAME="${APP_NAME}.app"
 DMG_NAME="${APP_NAME}-${VERSION}.dmg"

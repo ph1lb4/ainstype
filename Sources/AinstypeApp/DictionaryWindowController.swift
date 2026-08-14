@@ -10,6 +10,7 @@ protocol SettingsDelegate: AnyObject {
     func settingsDidToggleLiveTranscription(_ enabled: Bool)
     func settingsDidChangeLiveMode(_ mode: LiveMode)
     func settingsDidChangeInputDevice(_ value: String)
+    func settingsDidChangeClipboardHold(_ seconds: Int)
 }
 
 /// Manages the app window: a Settings tab, the dictionary replacements, and the
@@ -34,6 +35,11 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     private var liveCheckbox: NSButton!
     private var liveModePopup: NSPopUpButton!
     private var inputDevicePopup: NSPopUpButton!
+    private var clipboardHoldPopup: NSPopUpButton!
+    /// Hold duration in seconds for each `clipboardHoldPopup` item, by index.
+    /// 0 = off. A value from config.toml outside this list is appended as an
+    /// extra item so opening Settings doesn't silently overwrite it.
+    private var clipboardHoldValues: [Int] = []
     /// Config value for each `inputDevicePopup` item, by index (kept in sync
     /// when the popup is rebuilt in `populateSettings`).
     private var inputDeviceValues: [String] = []
@@ -167,7 +173,11 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         inputDevicePopup.target = self
         inputDevicePopup.action = #selector(inputDeviceChanged)
 
-        let hint = NSTextField(wrappingLabelWithString: "Sentence commits a whole phrase at a time; Word commits each word as it's confirmed (snappier, but types in bursts). The built-in mic keeps Bluetooth headphones in full-quality music playback; picking the headset's own mic drops it into call-quality audio. Other options (model, sample rate) live in ~/.config/ainstype/config.toml.")
+        clipboardHoldPopup = NSPopUpButton()
+        clipboardHoldPopup.target = self
+        clipboardHoldPopup.action = #selector(clipboardHoldChanged)
+
+        let hint = NSTextField(wrappingLabelWithString: "Sentence commits a whole phrase at a time; Word commits each word as it's confirmed (snappier, but types in bursts). The built-in mic keeps Bluetooth headphones in full-quality music playback; picking the headset's own mic drops it into call-quality audio. Keeping the latest transcription on the clipboard lets you paste it yourself with ⌘V for that long; afterwards your previous clipboard content comes back. Other options (model, sample rate) live in ~/.config/ainstype/config.toml.")
         hint.font = .systemFont(ofSize: 10)
         hint.textColor = .secondaryLabelColor
         hint.preferredMaxLayoutWidth = 360
@@ -178,6 +188,7 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
             settingsRow("Language:", languageField),
             settingsRow("", liveCheckbox),
             settingsRow("Live mode:", liveModePopup),
+            settingsRow("Keep on clipboard:", clipboardHoldPopup),
             hint,
         ])
         stack.orientation = .vertical
@@ -201,7 +212,9 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     private func settingsRow(_ label: String, _ control: NSView) -> NSView {
         let l = NSTextField(labelWithString: label)
         l.alignment = .right
-        l.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        // Wide enough for the longest label ("Keep on clipboard:", ~118pt) with
+        // room to spare, so nothing truncates.
+        l.widthAnchor.constraint(equalToConstant: 130).isActive = true
         let row = NSStackView(views: [l, control])
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -220,6 +233,23 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         liveModePopup.selectItem(at: config.liveMode == .word ? 1 : 0)
         liveModePopup.isEnabled = config.liveTranscription
         populateInputDevices(selected: config.recording.inputDevice)
+        populateClipboardHold(selected: config.clipboardHoldSeconds)
+    }
+
+    /// Fill the clipboard-hold popup. Off plus the two presets; a custom value
+    /// from config.toml is kept as its own entry.
+    private func populateClipboardHold(selected: Int) {
+        clipboardHoldPopup.removeAllItems()
+        clipboardHoldValues = [0, 5, 10]
+        clipboardHoldPopup.addItems(withTitles: ["Off", "5 seconds", "10 seconds"])
+
+        if let idx = clipboardHoldValues.firstIndex(of: selected) {
+            clipboardHoldPopup.selectItem(at: idx)
+        } else {
+            clipboardHoldPopup.addItem(withTitle: "\(selected) seconds")
+            clipboardHoldValues.append(selected)
+            clipboardHoldPopup.selectItem(at: clipboardHoldValues.count - 1)
+        }
     }
 
     /// Rebuild the microphone popup from the currently connected devices. The
@@ -267,6 +297,12 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     @objc private func liveModeChanged() {
         let mode: LiveMode = liveModePopup.indexOfSelectedItem == 1 ? .word : .sentence
         settingsDelegate?.settingsDidChangeLiveMode(mode)
+    }
+
+    @objc private func clipboardHoldChanged() {
+        let idx = clipboardHoldPopup.indexOfSelectedItem
+        guard idx >= 0, idx < clipboardHoldValues.count else { return }
+        settingsDelegate?.settingsDidChangeClipboardHold(clipboardHoldValues[idx])
     }
 
     @objc private func inputDeviceChanged() {
@@ -392,7 +428,8 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
 
     @objc private func copyLatestHistory() {
         guard let latest = history.recent().first else { return }
-        Clipboard.copy(latest.text)
+        // Pinned so a clipboard hold still in flight can't restore over it.
+        Clipboard.copyPinned(latest.text)
     }
 
     // MARK: - Actions

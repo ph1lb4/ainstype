@@ -65,12 +65,17 @@ Edit `~/.config/ainstype/config.toml`:
 ```toml
 language = "en"           # optional, auto-detect if omitted
 live_transcription = true # paste text incrementally while you speak (on by default; toggle from the menu)
+clipboard_hold_seconds = 0 # keep the latest transcription on the clipboard this long (0 = off, 5 or 10 in Settings)
 
 [recording]
 hotkey = "cmd_r"         # cmd, cmd_r, alt, alt_r, ctrl, ctrl_r
 ```
 
 **Live transcription** (on by default) pastes your words in chunks every couple of seconds as you keep talking, instead of all at once on release. Text appears with a ~2–4s lag (Whisper revises the most recent words as it hears more context), and only finalized text is pasted — so it never garbles or duplicates. Toggle it from the menu bar or via the config key above.
+
+**When text doesn't land**, a bubble appears at the bottom of the screen with the transcription and a Copy button. It stays for ten seconds (longer while the pointer is over it) and never takes keyboard focus, so you can hit Copy and then ⌘V straight into the app you were dictating into.
+
+**Keep on clipboard** (Settings → Keep on clipboard: Off / 5 / 10 seconds) leaves every transcription on the clipboard for that long, so a manual ⌘V always works; afterwards whatever you had copied before comes back. **Copy Latest** in the menu bar puts the last transcription back on the clipboard for good.
 
 The **History** tab (menu bar → Recent Transcriptions…, or the Dictionary window) keeps the last five transcriptions so you can copy text back if a paste didn't land in the focused app.
 
