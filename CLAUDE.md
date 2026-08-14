@@ -25,7 +25,7 @@ The pipeline flows: **hotkey → record → transcribe → dictionary replacemen
 - `App.swift` — `@main` entry point, `NSApplicationDelegate`, sleep/wake handling.
 - `StatusMenuController.swift` — `NSStatusItem` menu bar UI, state machine (setup/downloading/loading/idle/recording/processing), first-run setup dialog, Start at Login toggle.
 - `HotkeyMonitor.swift` — `NSEvent.addGlobalMonitorForEvents(.flagsChanged)` for modifier key hotkeys. Requires Input Monitoring permission.
-- `AudioRecorder.swift` — `AVAudioEngine` capture, outputs 16kHz mono Float32 array.
+- `AudioRecorder.swift` — `AVAudioEngine` capture, outputs 16kHz mono Float32 array. Pins the capture device (`InputDeviceSelection`; defaults to system default, user can pick "builtin") via CoreAudio so recording needn't force Bluetooth headphones into the low-quality call profile; `AudioDevices` enumerates input devices for the Settings picker.
 - `Pipeline.swift` — Orchestrates: WhisperKit transcribe → dictionary replacements → clipboard paste. Two-phase warmUp: fast GPU load (~5-10s), then background ANE specialization.
 - `ModelState.swift` — Persists downloaded model path and ANE specialization state to `~/.config/ainstype/model_state.json`.
 - `Dictionary.swift` — Reads `dictionary.toml`, applies spoken→written replacements. (Whisper initial-prompt biasing was removed: WhisperKit 0.17.0–1.0.0 returns empty transcriptions when `promptTokens` is set; the `[terms]` TOML section is preserved on save for the Python CLI.)
@@ -39,7 +39,7 @@ The pipeline flows: **hotkey → record → transcribe → dictionary replacemen
 Config dir: `~/.config/ainstype/`.
 
 Files:
-- `config.toml` — User overrides (hotkey, language)
+- `config.toml` — User overrides (hotkey, language, `recording.input_device`)
 - `dictionary.toml` — Custom terms for Whisper biasing + spoken→written replacements
 - `model_state.json` — Cached WhisperKit model path and ANE specialization state
 

@@ -9,6 +9,7 @@ protocol SettingsDelegate: AnyObject {
     func settingsDidChangeLanguage(_ language: String?)
     func settingsDidToggleLiveTranscription(_ enabled: Bool)
     func settingsDidChangeLiveMode(_ mode: LiveMode)
+    func settingsDidChangeInputDevice(_ value: String)
 }
 
 /// Manages the app window: a Settings tab, the dictionary replacements, and the
@@ -32,6 +33,10 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     private var languageField: NSTextField!
     private var liveCheckbox: NSButton!
     private var liveModePopup: NSPopUpButton!
+    private var inputDevicePopup: NSPopUpButton!
+    /// Config value for each `inputDevicePopup` item, by index (kept in sync
+    /// when the popup is rebuilt in `populateSettings`).
+    private var inputDeviceValues: [String] = []
 
     /// Hotkey config value ↔ human label, in display order.
     private let hotkeyOptions: [(key: String, label: String)] = [
@@ -158,13 +163,18 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         liveModePopup.target = self
         liveModePopup.action = #selector(liveModeChanged)
 
-        let hint = NSTextField(wrappingLabelWithString: "Sentence commits a whole phrase at a time; Word commits each word as it's confirmed (snappier, but types in bursts). Other options (model, sample rate) live in ~/.config/ainstype/config.toml.")
+        inputDevicePopup = NSPopUpButton()
+        inputDevicePopup.target = self
+        inputDevicePopup.action = #selector(inputDeviceChanged)
+
+        let hint = NSTextField(wrappingLabelWithString: "Sentence commits a whole phrase at a time; Word commits each word as it's confirmed (snappier, but types in bursts). The built-in mic keeps Bluetooth headphones in full-quality music playback; picking the headset's own mic drops it into call-quality audio. Other options (model, sample rate) live in ~/.config/ainstype/config.toml.")
         hint.font = .systemFont(ofSize: 10)
         hint.textColor = .secondaryLabelColor
         hint.preferredMaxLayoutWidth = 360
 
         let stack = NSStackView(views: [
             settingsRow("Hotkey:", hotkeyPopup),
+            settingsRow("Microphone:", inputDevicePopup),
             settingsRow("Language:", languageField),
             settingsRow("", liveCheckbox),
             settingsRow("Live mode:", liveModePopup),
@@ -209,6 +219,37 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         liveCheckbox.state = config.liveTranscription ? .on : .off
         liveModePopup.selectItem(at: config.liveMode == .word ? 1 : 0)
         liveModePopup.isEnabled = config.liveTranscription
+        populateInputDevices(selected: config.recording.inputDevice)
+    }
+
+    /// Rebuild the microphone popup from the currently connected devices. The
+    /// built-in mic is offered as a stable "Built-in Microphone" entry (rather
+    /// than by name) so the choice survives renames; other inputs are listed by
+    /// name. A saved-but-disconnected device is kept as a disabled entry so the
+    /// selection isn't silently lost.
+    private func populateInputDevices(selected: String) {
+        inputDevicePopup.removeAllItems()
+        inputDeviceValues = []
+
+        func add(_ title: String, _ value: String) {
+            inputDevicePopup.addItem(withTitle: title)
+            inputDeviceValues.append(value)
+        }
+
+        add("System Default", "default")
+        add("Built-in Microphone", "builtin")
+        for device in AudioDevices.inputDevices() where !device.isBuiltIn {
+            add(device.name, device.uid)
+        }
+
+        if let idx = inputDeviceValues.firstIndex(of: selected) {
+            inputDevicePopup.selectItem(at: idx)
+        } else {
+            // Saved device isn't connected right now — surface it so it's clear
+            // what's selected and it isn't overwritten by merely opening Settings.
+            add("\(selected) (disconnected)", selected)
+            inputDevicePopup.selectItem(at: inputDeviceValues.count - 1)
+        }
     }
 
     @objc private func hotkeyChanged() {
@@ -226,6 +267,12 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     @objc private func liveModeChanged() {
         let mode: LiveMode = liveModePopup.indexOfSelectedItem == 1 ? .word : .sentence
         settingsDelegate?.settingsDidChangeLiveMode(mode)
+    }
+
+    @objc private func inputDeviceChanged() {
+        let idx = inputDevicePopup.indexOfSelectedItem
+        guard idx >= 0, idx < inputDeviceValues.count else { return }
+        settingsDelegate?.settingsDidChangeInputDevice(inputDeviceValues[idx])
     }
 
     // MARK: - Replacements Tab

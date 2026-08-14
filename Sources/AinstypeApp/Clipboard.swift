@@ -105,47 +105,55 @@ enum Clipboard {
         return true
     }
 
-    /// Insert `text` by synthesizing per-character key events, the way a text
-    /// expander does — NOT via the pasteboard. Used by live mode, which inserts
-    /// many small chunks as words are confirmed.
+    /// Insert `text` into the focused editable element. Used by live mode, which
+    /// inserts many small chunks as words are confirmed.
     ///
-    /// Live mode cannot paste: Slack and other Electron / rich-text editors strip
-    /// whitespace at both edges of every paste, so a space between two separately
-    /// pasted chunks always vanishes and the words merge (`therevised`,
-    /// `shouldwork`). Typed characters go through the normal keyboard-input path,
-    /// so their spaces survive everywhere. Typing also leaves the clipboard
-    /// untouched, so live mode no longer needs to save/restore it.
+    /// Live mode normally writes the focused element's selected-text attribute.
+    /// That is an atomic insert/selection replacement, preserves boundary spaces,
+    /// and leaves the clipboard untouched. It also avoids synthetic keyboard
+    /// events while the push-to-talk modifier is physically held.
     ///
-    /// The push-to-talk hotkey is a modifier key (⌘/⌥/⌃) that is physically held
-    /// for the whole dictation, so every synthesized keystroke must be emitted
-    /// with NO modifier flags — otherwise the held ⌘ combines with each letter
-    /// into a shortcut (`t` → ⌘T opens a browser tab). Two safeguards ensure a
-    /// clean event: a private-state source carries no hardware-modifier state to
-    /// inherit, and each event's flags are explicitly cleared.
+    /// Quartz Unicode keyboard events are unsuitable here: application frameworks
+    /// may ignore their Unicode payload and translate virtual keycode 0 as `A`
+    /// using the physical modifier state. With Right Command held that becomes
+    /// Cmd+A and selects the target's contents. If the focused app does not expose
+    /// an editable accessibility element, fall back to the regular paste path.
     static func typeText(_ text: String) {
-        let source = CGEventSource(stateID: CGEventSourceStateID.privateState)
-        // One character per event is the most broadly compatible approach; some
-        // apps only accept the first character of a multi-character unicode event.
-        for character in text {
-            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
-                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
-            else {
-                Logger.error("Failed to create CGEvent for typing")
-                return
-            }
+        guard !text.isEmpty else { return }
+        if insertIntoFocusedElement(text) { return }
 
-            var units = Array(String(character).utf16)
-            keyDown.keyboardSetUnicodeString(stringLength: units.count, unicodeString: &units)
-            keyUp.keyboardSetUnicodeString(stringLength: units.count, unicodeString: &units)
+        Logger.log("Focused element does not support direct text insertion; using paste fallback")
+        _ = pasteToFocusedApp(text)
+    }
 
-            // Strip any inherited modifier flags so the held hotkey can't turn
-            // this keystroke into a shortcut.
-            keyDown.flags = CGEventFlags(rawValue: 0)
-            keyUp.flags = CGEventFlags(rawValue: 0)
+    /// Replace the current selection (or the zero-length insertion-point
+    /// selection) in the focused editable accessibility element.
+    private static func insertIntoFocusedElement(_ text: String) -> Bool {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedValue
+        ) == .success,
+        let focusedValue
+        else { return false }
 
-            keyDown.post(tap: CGEventTapLocation.cghidEventTap)
-            keyUp.post(tap: CGEventTapLocation.cghidEventTap)
-        }
+        let focused = focusedValue as! AXUIElement
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(
+            focused,
+            kAXSelectedTextAttribute as CFString,
+            &settable
+        ) == .success,
+        settable.boolValue
+        else { return false }
+
+        return AXUIElementSetAttributeValue(
+            focused,
+            kAXSelectedTextAttribute as CFString,
+            text as CFString
+        ) == .success
     }
 
     /// Check if the app has Accessibility permission (needed for CGEvent paste).

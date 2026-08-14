@@ -87,6 +87,39 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(c.recording.hotkey, "cmd_r")
         XCTAssertTrue(c.autoPaste)
     }
+
+    func testInputDeviceDefaultsToSystemDefault() {
+        // Absent from config: use the system default input (preserves prior
+        // behavior). Picking "builtin" in Settings is the Bluetooth-music fix.
+        XCTAssertEqual(Config().recording.inputDevice, "default")
+        XCTAssertEqual(InputDeviceSelection(configValue: Config().recording.inputDevice), .systemDefault)
+    }
+
+    func testInputDeviceOverride() {
+        var c = Config()
+        c.applyTOML("""
+        [recording]
+        input_device = "AppleUSBAudioEngine:SomeMic"
+        """)
+        XCTAssertEqual(c.recording.inputDevice, "AppleUSBAudioEngine:SomeMic")
+        XCTAssertEqual(
+            InputDeviceSelection(configValue: c.recording.inputDevice),
+            .uid("AppleUSBAudioEngine:SomeMic")
+        )
+    }
+}
+
+final class InputDeviceSelectionTests: XCTestCase {
+    func testConfigValueRoundTrip() {
+        for selection: InputDeviceSelection in [.systemDefault, .builtIn, .uid("some-uid")] {
+            XCTAssertEqual(InputDeviceSelection(configValue: selection.configValue), selection)
+        }
+    }
+
+    func testLegacyAndEmptyValuesMapToSystemDefault() {
+        XCTAssertEqual(InputDeviceSelection(configValue: ""), .systemDefault)
+        XCTAssertEqual(InputDeviceSelection(configValue: "default"), .systemDefault)
+    }
 }
 
 final class HotkeyMonitorTests: XCTestCase {

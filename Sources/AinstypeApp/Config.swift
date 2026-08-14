@@ -4,6 +4,11 @@ import TOMLKit
 struct RecordingConfig {
     var hotkey: String = "cmd_r"
     var sampleRate: Int = 16000
+    /// Which microphone to capture from, as an `InputDeviceSelection` config
+    /// value ("default", "builtin", or a device UID). Defaults to the system
+    /// default input; set it to "builtin" in Settings to keep Bluetooth
+    /// headphones out of call mode while recording.
+    var inputDevice: String = "default"
 }
 
 struct TranscriptionConfig {
@@ -97,6 +102,7 @@ struct Config {
         if let rec = table["recording"]?.table {
             if let hotkey = rec["hotkey"]?.string { self.recording.hotkey = hotkey }
             if let sr = rec["sample_rate"]?.int { self.recording.sampleRate = sr }
+            if let dev = rec["input_device"]?.string { self.recording.inputDevice = dev }
         }
 
         if let trans = table["transcription"]?.table {

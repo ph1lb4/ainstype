@@ -104,6 +104,7 @@ class StatusMenuController {
 
         // Create recorder
         recorder = AudioRecorder(sampleRate: config.recording.sampleRate)
+        recorder.inputDevice = InputDeviceSelection(configValue: config.recording.inputDevice)
 
         // Ask for permission to post our error/empty-recording notifications.
         requestNotificationAuthorization()
@@ -611,5 +612,13 @@ extension StatusMenuController: SettingsDelegate {
         config.liveMode = mode
         config.saveUserConfig(key: "live_mode", value: mode.rawValue)
         pipeline.log("Live mode set to \(mode.rawValue)")
+    }
+
+    func settingsDidChangeInputDevice(_ value: String) {
+        guard value != config.recording.inputDevice else { return }
+        config.recording.inputDevice = value
+        config.saveUserConfig(key: "recording.input_device", value: value)
+        recorder.inputDevice = InputDeviceSelection(configValue: value)
+        pipeline.log("Input device set to \(value)")
     }
 }

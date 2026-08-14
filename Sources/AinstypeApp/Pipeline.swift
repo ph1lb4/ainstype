@@ -373,6 +373,14 @@ final class LiveSession {
 /// holding back trailing words that may start a multi-word replacement phrase,
 /// applying dictionary replacements, and accumulating the session transcript.
 final class LiveTextAssembler {
+    private static let openingOrJoiningPunctuation: Set<Character> = [
+        "(", "[", "{", "\u{2018}", "\u{201C}", "-", "\u{2013}", "\u{2014}", "/",
+    ]
+    private static let attachingPunctuation: Set<Character> = [
+        ".", ",", "!", "?", ";", ":", "%", "\u{2026}",
+        ")", "]", "}", "'", "\u{2019}", "-", "\u{2013}", "\u{2014}",
+    ]
+
     private let dictionary: DictionaryManager
     private var hasEmitted = false
     /// The last confirmed word (normalized), used to drop an accidental repeat
@@ -390,17 +398,20 @@ final class LiveTextAssembler {
         self.dictionary = dictionary
     }
 
-    /// Prepare a newly-confirmed chunk for insertion. Whisper prefixes each word/
-    /// segment with a leading space, which naturally separates chunks once they
-    /// are typed (typed spaces, unlike pasted edge whitespace, are never trimmed
-    /// by the target field); the very first output's leading space is dropped so
-    /// text doesn't start with a space. Returns nil if nothing is left to emit.
+    /// Prepare a newly-confirmed chunk for insertion. Whisper usually prefixes
+    /// words/segments with a leading space, but a decode that starts at
+    /// `clipTimestamps` is also allowed to return text without one. Normalize the
+    /// boundary explicitly so independently decoded chunks can never merge. The
+    /// very first output's leading space is dropped so text doesn't start with a
+    /// space. Returns nil if nothing is left to emit.
     /// With `flush`, held-back text is emitted too — used for the final tail
     /// when recording stops.
     func assemble(_ raw: String, flush: Bool = false) -> String? {
         var text = raw
         if !hasEmitted && pendingHold.isEmpty {
             text = String(text.drop { $0 == " " })
+        } else {
+            text = addMissingBoundarySpace(to: text)
         }
         text = dropDuplicateLeadingWord(text)
 
@@ -431,6 +442,21 @@ final class LiveTextAssembler {
     /// on an error path so held words are not silently dropped.
     func flushPending() -> String? {
         assemble("", flush: true)
+    }
+
+    /// Add the separator that Whisper sometimes omits at the start of a clipped
+    /// decode. Closing punctuation and contraction suffixes intentionally remain
+    /// attached to the preceding word.
+    private func addMissingBoundarySpace(to text: String) -> String {
+        guard let first = text.first, !first.isWhitespace else { return text }
+
+        let previous = pendingHold.last ?? transcript.last
+        guard let previous, !previous.isWhitespace else { return text }
+
+        guard !Self.openingOrJoiningPunctuation.contains(previous),
+              !Self.attachingPunctuation.contains(first)
+        else { return text }
+        return " " + text
     }
 
     /// If `text`'s first word repeats `lastWord`, remove it (keeping the space

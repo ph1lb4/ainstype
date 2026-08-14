@@ -247,6 +247,34 @@ final class LiveTextAssemblerTests: XCTestCase {
         XCTAssertEqual(a.assemble(" friend"), " friend")
     }
 
+    func testLaterChunkGetsSeparatorWhenWhisperOmitsIt() {
+        let a = makeAssembler()
+        _ = a.assemble(" afterwards")
+        XCTAssertEqual(a.assemble("sometimes this happens"), " sometimes this happens")
+        XCTAssertEqual(a.transcript, "afterwards sometimes this happens")
+    }
+
+    func testMissingSeparatorIsAddedAfterSentencePunctuation() {
+        let a = makeAssembler()
+        _ = a.assemble(" after.")
+        XCTAssertEqual(a.assemble("Afterwards"), " Afterwards")
+        XCTAssertEqual(a.transcript, "after. Afterwards")
+    }
+
+    func testPunctuationChunkStillAttachesToPreviousWord() {
+        let a = makeAssembler()
+        _ = a.assemble(" hello")
+        XCTAssertEqual(a.assemble("."), ".")
+        XCTAssertEqual(a.transcript, "hello.")
+    }
+
+    func testWordChunkStillAttachesAfterOpeningPunctuation() {
+        let a = makeAssembler(replacements: ["open paren": "("])
+        _ = a.assemble(" open paren")
+        XCTAssertEqual(a.assemble("word"), "word")
+        XCTAssertEqual(a.transcript, "(word")
+    }
+
     func testDuplicateBoundaryWordDropped() {
         let a = makeAssembler()
         _ = a.assemble(" hello there")
@@ -267,6 +295,13 @@ final class LiveTextAssemblerTests: XCTestCase {
         let a = makeAssembler()
         XCTAssertEqual(a.assemble(" this is new"), "this is")
         XCTAssertEqual(a.assemble(" line here"), " \n here")
+        XCTAssertEqual(a.transcript, "this is \n here")
+    }
+
+    func testReplacementAcrossChunksWhenWhisperOmitsSpace() {
+        let a = makeAssembler()
+        XCTAssertEqual(a.assemble(" this is new"), "this is")
+        XCTAssertEqual(a.assemble("line here"), " \n here")
         XCTAssertEqual(a.transcript, "this is \n here")
     }
 
