@@ -177,7 +177,7 @@ class DictionaryWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         clipboardHoldPopup.target = self
         clipboardHoldPopup.action = #selector(clipboardHoldChanged)
 
-        let hint = NSTextField(wrappingLabelWithString: "Sentence commits a whole phrase at a time; Word commits each word as it's confirmed (snappier, but types in bursts). The built-in mic keeps Bluetooth headphones in full-quality music playback; picking the headset's own mic drops it into call-quality audio. Keeping the latest transcription on the clipboard lets you paste it yourself with ⌘V for that long; afterwards your previous clipboard content comes back. Other options (model, sample rate) live in ~/.config/ainstype/config.toml.")
+        let hint = NSTextField(wrappingLabelWithString: "Sentence commits a whole phrase at a time; Word commits each word as it's confirmed (snappier, but types in bursts). The built-in mic keeps Bluetooth headphones in full-quality music playback; picking the headset's own mic drops it into call-quality audio. Keeping the latest transcription on the clipboard lets you paste it yourself with ⌘V for that long; afterwards your previous clipboard content comes back (this does not apply while live insertion is on — live mode never touches the clipboard; use Copy Latest instead). Other options (model, sample rate) live in ~/.config/ainstype/config.toml.")
         hint.font = .systemFont(ofSize: 10)
         hint.textColor = .secondaryLabelColor
         hint.preferredMaxLayoutWidth = 360

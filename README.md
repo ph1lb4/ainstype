@@ -73,9 +73,9 @@ hotkey = "cmd_r"         # cmd, cmd_r, alt, alt_r, ctrl, ctrl_r
 
 **Live transcription** (on by default) pastes your words in chunks every couple of seconds as you keep talking, instead of all at once on release. Text appears with a ~2–4s lag (Whisper revises the most recent words as it hears more context), and only finalized text is pasted — so it never garbles or duplicates. Toggle it from the menu bar or via the config key above.
 
-**When text doesn't land**, a bubble appears at the bottom of the screen with the transcription and a Copy button. It stays for ten seconds (longer while the pointer is over it) and never takes keyboard focus, so you can hit Copy and then ⌘V straight into the app you were dictating into.
+**When text doesn't land**, a bubble appears at the bottom of the screen with the transcription and a Copy button. It goes away after about six seconds (a little longer while the pointer is over it) and never takes keyboard focus, so you can hit Copy and then ⌘V straight into the app you were dictating into. A synthetic ⌘V reports nothing back, so delivery is checked against the focused element afterwards: if there was nothing focused that accepts text — a Finder window, the desktop, a plain web page — that counts as a failure and you get the bubble.
 
-**Keep on clipboard** (Settings → Keep on clipboard: Off / 5 / 10 seconds) leaves every transcription on the clipboard for that long, so a manual ⌘V always works; afterwards whatever you had copied before comes back. **Copy Latest** in the menu bar puts the last transcription back on the clipboard for good.
+**Keep on clipboard** (Settings → Keep on clipboard: Off / 5 / 10 seconds) leaves the transcription on the clipboard for that long, so a manual ⌘V always works; afterwards whatever you had copied before comes back. This applies to one-shot mode only — with live insertion on, the clipboard is never touched, so dictating can't interfere with what you have copied. **Copy Latest** in the menu bar puts the last transcription back on the clipboard for good, live mode included.
 
 The **History** tab (menu bar → Recent Transcriptions…, or the Dictionary window) keeps the last five transcriptions so you can copy text back if a paste didn't land in the focused app.
 

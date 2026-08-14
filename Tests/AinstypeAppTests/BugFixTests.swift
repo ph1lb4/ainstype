@@ -381,6 +381,82 @@ final class RestoreLedgerTests: XCTestCase {
     }
 }
 
+// MARK: - Paste verification
+
+/// A posted ⌘V reports nothing back, so delivery is judged by whether the
+/// focused element changed. The rules are asymmetric on purpose: any observed
+/// change means delivered, but `.failed` requires that the target could not
+/// have taken text at all — editors that don't update these attributes must not
+/// produce a bubble on every successful dictation.
+final class FocusSnapshotTests: XCTestCase {
+    /// Any AXUIElement will do; compare() only ever identity-checks it.
+    private func element() -> AXUIElement { AXUIElementCreateApplication(getpid()) }
+
+    private func snapshot(
+        _ el: AXUIElement?,
+        textCapable: Bool = true,
+        chars: Int? = 10,
+        caret: Int? = 3
+    ) -> FocusSnapshot {
+        FocusSnapshot(element: el, role: "AXTextArea", textCapable: textCapable, characterCount: chars, caretLocation: caret)
+    }
+
+    /// The reported bug: focus on something that isn't a text field (or nothing
+    /// at all) used to look like success because the events were posted fine.
+    func testNoFocusedElementIsFailure() {
+        XCTAssertEqual(FocusSnapshot.compare(before: snapshot(nil), after: snapshot(nil)), .failed)
+    }
+
+    func testUnchangedNonTextTargetIsFailure() {
+        let el = element()
+        let before = snapshot(el, textCapable: false)
+        XCTAssertEqual(FocusSnapshot.compare(before: before, after: before), .failed)
+    }
+
+    func testGrowingCharacterCountIsDelivered() {
+        let el = element()
+        let outcome = FocusSnapshot.compare(
+            before: snapshot(el, chars: 10),
+            after: snapshot(el, chars: 25)
+        )
+        XCTAssertEqual(outcome, .delivered)
+    }
+
+    /// Replacing a selection can leave the length unchanged; the caret still moves.
+    func testMovedCaretIsDelivered() {
+        let el = element()
+        let outcome = FocusSnapshot.compare(
+            before: snapshot(el, chars: 10, caret: 3),
+            after: snapshot(el, chars: 10, caret: 8)
+        )
+        XCTAssertEqual(outcome, .delivered)
+    }
+
+    /// Canvas- and web-based editors accept the paste but never report a change.
+    /// Those must stay `.unknown` (no bubble), or every dictation into them
+    /// would look like a failure.
+    func testUnchangedEditableTargetIsUnknown() {
+        let el = element()
+        let before = snapshot(el, textCapable: true)
+        XCTAssertEqual(FocusSnapshot.compare(before: before, after: before), .unknown)
+    }
+
+    func testFocusMovedMidPasteIsUnknown() {
+        let outcome = FocusSnapshot.compare(
+            before: snapshot(AXUIElementCreateApplication(getpid())),
+            after: snapshot(AXUIElementCreateApplication(1))
+        )
+        XCTAssertEqual(outcome, .unknown)
+    }
+
+    /// Attributes the app doesn't expose must not be read as "no change".
+    func testUnreadableCountsOnEditableTargetAreUnknown() {
+        let el = element()
+        let before = snapshot(el, chars: nil, caret: nil)
+        XCTAssertEqual(FocusSnapshot.compare(before: before, after: before), .unknown)
+    }
+}
+
 // MARK: - Clipboard hold setting
 
 final class ClipboardHoldConfigTests: XCTestCase {

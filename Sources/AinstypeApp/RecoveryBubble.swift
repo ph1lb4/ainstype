@@ -39,7 +39,13 @@ final class RecoveryBubble {
 
     /// How long the bubble stays up when the pointer is elsewhere. Long enough
     /// to notice it and reach for the mouse; hovering suspends the countdown.
-    static let visibleDuration: TimeInterval = 10
+    static let visibleDuration: TimeInterval = 6
+
+    /// Absolute ceiling on how long a bubble can stay up, hover or no hover.
+    /// Without it, a pointer that merely happens to rest over the bubble's
+    /// corner of the screen (or one that entered without a matching exit event)
+    /// would pin it there indefinitely.
+    static let maximumLifetime: TimeInterval = 20
 
     /// Bubble width; the height follows the content.
     private static let width: CGFloat = 420
@@ -59,6 +65,8 @@ final class RecoveryBubble {
     private var copyButton: NSButton!
     private var iconView: NSImageView!
     private var dismissTimer: Timer?
+    /// Backstop timer for `maximumLifetime`; never suspended by hovering.
+    private var lifetimeTimer: Timer?
     /// Full text (not the elided preview) that the Copy button puts on the
     /// clipboard; nil for failures with nothing to recover.
     private var copyText: String?
@@ -85,9 +93,9 @@ final class RecoveryBubble {
         }
     }
 
-    /// Hide the bubble if it's up (no-op otherwise). Main thread only.
+    /// Hide the bubble if it's up (no-op otherwise). Safe from any thread.
     static func dismiss() {
-        shared.hide()
+        DispatchQueue.main.async { shared.hide() }
     }
 
     // MARK: - Presentation
@@ -119,11 +127,15 @@ final class RecoveryBubble {
 
         panel.orderFrontRegardless()
         startDismissTimer()
+        lifetimeTimer?.invalidate()
+        lifetimeTimer = schedule(after: Self.maximumLifetime)
     }
 
     private func hide() {
         dismissTimer?.invalidate()
         dismissTimer = nil
+        lifetimeTimer?.invalidate()
+        lifetimeTimer = nil
         panel?.orderOut(nil)
     }
 
@@ -144,12 +156,19 @@ final class RecoveryBubble {
 
     private func startDismissTimer() {
         dismissTimer?.invalidate()
-        dismissTimer = Timer.scheduledTimer(
-            withTimeInterval: Self.visibleDuration,
-            repeats: false
-        ) { [weak self] _ in
+        dismissTimer = schedule(after: Self.visibleDuration)
+    }
+
+    /// Timer that hides the bubble, registered in `.common` run loop modes.
+    /// A plain `Timer.scheduledTimer` only fires in the default mode, so a bubble
+    /// shown while a menu is open or a scroll/drag is tracking would sit there
+    /// until the user happened to interact with something else.
+    private func schedule(after delay: TimeInterval) -> Timer {
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
             self?.hide()
         }
+        RunLoop.main.add(timer, forMode: .common)
+        return timer
     }
 
     /// Elide a long message for display; `copyText` keeps the full version.
@@ -280,9 +299,7 @@ final class RecoveryBubble {
         // Leave it up briefly so the "Copied" state is seen, then get out of
         // the way — the user's next move is ⌘V in their own app.
         dismissTimer?.invalidate()
-        dismissTimer = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: false) { [weak self] _ in
-            self?.hide()
-        }
+        dismissTimer = schedule(after: 1.2)
     }
 
     @objc private func dismissClicked() {

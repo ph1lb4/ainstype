@@ -248,6 +248,10 @@ class StatusMenuController {
     private func onHotkeyPress() {
         guard canStartRecording else { return }
 
+        // A bubble from the previous dictation has served its purpose once the
+        // next one starts — and it must not sit over the app being dictated into.
+        RecoveryBubble.dismiss()
+
         lock.lock()
         guard !isRecording else { lock.unlock(); return }
         isRecording = true
@@ -333,7 +337,7 @@ class StatusMenuController {
                         // session with the whole transcript, rather than a
                         // bubble per chunk: if one chunk can't be inserted, the
                         // rest of them can't either.
-                        if !Clipboard.typeText(chunk) { self.liveInsertFailed = true }
+                        if await !Clipboard.typeText(chunk) { self.liveInsertFailed = true }
                     }
                 } catch {
                     Logger.error("Live ingest error: \(error)")
@@ -359,7 +363,7 @@ class StatusMenuController {
             var finishError: String?
             do {
                 if let tail = try await session.finish(audio), !tail.isEmpty {
-                    if !Clipboard.typeText(tail) { liveInsertFailed = true }
+                    if await !Clipboard.typeText(tail) { liveInsertFailed = true }
                 }
                 // Privacy: log only sizes, never content.
                 Logger.log("Live session done: typed \(session.transcript.count) characters total")
@@ -370,7 +374,7 @@ class StatusMenuController {
                 // The final pass failed, but words held back for a possible
                 // cross-chunk replacement must still come out.
                 if let held = session.flushPending(), !held.isEmpty {
-                    if !Clipboard.typeText(held) { liveInsertFailed = true }
+                    if await !Clipboard.typeText(held) { liveInsertFailed = true }
                 }
             }
             let transcript = session.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -381,8 +385,14 @@ class StatusMenuController {
     }
 
     /// After a live session: surface anything that went wrong in a bubble the
-    /// user can copy from, and apply the clipboard hold to the finished
-    /// transcript so a manual ⌘V works for the configured window.
+    /// user can copy from.
+    ///
+    /// Live mode deliberately leaves the clipboard alone — the clipboard hold
+    /// does not apply here. Chunked insertion writes straight into the focused
+    /// element, so parking the transcript on the clipboard afterwards would
+    /// replace whatever the user had copied while they were still dictating and
+    /// pasting other things. Use "Copy Latest" to get a live transcript onto the
+    /// clipboard on purpose.
     private func reportLiveOutcome(transcript: String, finishError: String?) {
         if liveInsertFailed {
             liveInsertFailed = false
@@ -391,7 +401,7 @@ class StatusMenuController {
                 title: "Couldn\u{2019}t insert text into the app",
                 message: transcript,
                 copyText: transcript.isEmpty ? nil : transcript,
-                note: "It\u{2019}s on your clipboard \u{2014} press \u{2318}V to paste it. Check Accessibility permission in System Settings."
+                note: "Nothing was focused that accepts text. It\u{2019}s on your clipboard \u{2014} click into a text field and press \u{2318}V."
             )
             return
         }
@@ -403,14 +413,6 @@ class StatusMenuController {
                 copyText: transcript.isEmpty ? nil : transcript,
                 note: transcript.isEmpty ? nil : "Copy what was transcribed so far."
             )
-            return
-        }
-
-        // Live mode inserts text directly, so nothing was on the clipboard —
-        // put the finished transcript there for the hold window.
-        let hold = config.clipboardHoldDuration
-        if hold > 0, !transcript.isEmpty {
-            Clipboard.copyAndHold(transcript, for: hold)
         }
     }
 

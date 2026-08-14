@@ -220,15 +220,15 @@ class Pipeline {
         // Paste to focused app
         log("Pasting result...")
         if config.autoPaste {
-            let success = Clipboard.pasteToFocusedApp(text, holdFor: config.clipboardHoldDuration)
-            if !success {
-                log("Paste failed — check Accessibility permission")
+            let outcome = await Clipboard.pasteToFocusedApp(text, holdFor: config.clipboardHoldDuration)
+            if outcome == .failed {
+                log("Paste did not land in the focused app")
                 Clipboard.copyPinned(text)
                 RecoveryBubble.present(
                     title: "Couldn\u{2019}t paste into the app",
                     message: text,
                     copyText: text,
-                    note: "It\u{2019}s on your clipboard \u{2014} press \u{2318}V to paste it. Check Accessibility permission in System Settings."
+                    note: "Nothing was focused that accepts text. It\u{2019}s on your clipboard \u{2014} click into a text field and press \u{2318}V."
                 )
             }
         } else {

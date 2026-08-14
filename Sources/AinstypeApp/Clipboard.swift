@@ -49,9 +49,142 @@ struct RestoreLedger {
     }
 }
 
+/// What could be determined about a synthetic paste after the fact. A posted
+/// ⌘V is fire-and-forget, so "did it land?" has to be answered by watching the
+/// focused accessibility element instead of by a return code.
+enum PasteOutcome {
+    /// The focused element visibly changed — the text is in the app.
+    case delivered
+    /// The app doesn't expose enough through accessibility to tell. Treated as
+    /// success: assuming failure here would pop a bubble on every dictation in
+    /// apps with custom text engines.
+    case unknown
+    /// Nothing could have received the paste (no focused element, or focus was
+    /// on something that can't take text and didn't change).
+    case failed
+}
+
+/// A cheap fingerprint of the focused text element, taken before and after a
+/// paste to see whether anything actually changed.
+///
+/// Privacy: this never reads the focused field's *text*, only its character
+/// count and caret position (`kAXNumberOfCharacters`, `kAXSelectedTextRange`).
+/// Reading `kAXValue` would pull whatever the user has open — including
+/// password fields — into this process.
+struct FocusSnapshot {
+    let element: AXUIElement?
+    let role: String?
+    /// Whether this element looks like something that accepts typed text.
+    let textCapable: Bool
+    let characterCount: Int?
+    let caretLocation: Int?
+
+    static func capture() -> FocusSnapshot {
+        guard let element = focusedElement() else {
+            return FocusSnapshot(element: nil, role: nil, textCapable: false, characterCount: nil, caretLocation: nil)
+        }
+        return FocusSnapshot(
+            element: element,
+            role: string(element, kAXRoleAttribute),
+            textCapable: isTextCapable(element),
+            characterCount: int(element, kAXNumberOfCharactersAttribute),
+            caretLocation: caret(element)
+        )
+    }
+
+    /// Roles that take typed text even when their selected-text/value attributes
+    /// aren't settable (common in Electron and browser-hosted editors).
+    private static let textRoles: Set<String> = [
+        kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole, "AXSearchField",
+    ]
+
+    private static func isTextCapable(_ element: AXUIElement) -> Bool {
+        if settable(element, kAXSelectedTextAttribute) { return true }
+        if settable(element, kAXValueAttribute) { return true }
+        if let role = string(element, kAXRoleAttribute), textRoles.contains(role) { return true }
+        return false
+    }
+
+    /// Compare a before/after pair.
+    ///
+    /// Deliberately asymmetric: any observed change counts as delivery, but
+    /// `.failed` is only returned when the target could not plausibly have
+    /// accepted text. An editable element that reports no change lands on
+    /// `.unknown`, because plenty of editors (canvas- and web-based ones above
+    /// all) never update these attributes.
+    static func compare(before: FocusSnapshot, after: FocusSnapshot) -> PasteOutcome {
+        if before.element == nil && after.element == nil { return .failed }
+        guard let before_ = before.element, let after_ = after.element else { return .unknown }
+        // Focus moved while pasting — can't attribute the change either way.
+        guard CFEqual(before_, after_) else { return .unknown }
+
+        if let a = before.characterCount, let b = after.characterCount, a != b { return .delivered }
+        if let a = before.caretLocation, let b = after.caretLocation, a != b { return .delivered }
+
+        // Nothing changed. Only call that a failure when the target wasn't
+        // something that takes text in the first place — that's the case the
+        // user can act on ("you were focused on a window, not a text field").
+        return before.textCapable ? .unknown : .failed
+    }
+
+    // MARK: - Accessibility reads
+
+    private static func focusedElement() -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            AXUIElementCreateSystemWide(),
+            kAXFocusedUIElementAttribute as CFString,
+            &value
+        ) == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID()
+        else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    private static func settable(_ element: AXUIElement, _ attribute: String) -> Bool {
+        var flag = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(element, attribute as CFString, &flag) == .success
+        else { return false }
+        return flag.boolValue
+    }
+
+    private static func string(_ element: AXUIElement, _ attribute: String) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success
+        else { return nil }
+        return value as? String
+    }
+
+    private static func int(_ element: AXUIElement, _ attribute: String) -> Int? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success
+        else { return nil }
+        return (value as? NSNumber)?.intValue
+    }
+
+    private static func caret(_ element: AXUIElement) -> Int? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXSelectedTextRangeAttribute as CFString,
+            &value
+        ) == .success, let value, CFGetTypeID(value) == AXValueGetTypeID()
+        else { return nil }
+        let axValue = value as! AXValue
+        guard AXValueGetType(axValue) == .cfRange else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(axValue, .cfRange, &range) else { return nil }
+        return range.location
+    }
+}
+
 enum Clipboard {
     /// Virtual keycode for the V key (Cmd+V paste).
     private static let vKeyCode: CGKeyCode = 9
+
+    /// How long to give the focused app to process the synthetic ⌘V before
+    /// checking whether anything changed. Must exceed `restoreDelay` so the
+    /// clipboard is still intact while the app reads it.
+    static let verifyDelay: TimeInterval = 0.35
 
     /// How long to wait before restoring the user's previous clipboard after a
     /// synthetic paste. This is a best-effort race: the synthetic Cmd+V is delivered
@@ -115,24 +248,40 @@ enum Clipboard {
 
     private static let restoreLedger = OSAllocatedUnfairLock(initialState: RestoreLedger())
 
-    /// Copy text to clipboard, simulate Cmd+V paste, then restore previous clipboard.
+    /// Copy text to the clipboard, post ⌘V, check whether it actually landed,
+    /// then restore the user's previous clipboard.
     ///
     /// `hold` (the clipboard-hold setting) extends how long the text stays on the
     /// clipboard after the paste, so the user can repeat the paste by hand if the
     /// automatic one didn't land where they wanted.
-    static func pasteToFocusedApp(_ text: String, holdFor hold: TimeInterval = 0) -> Bool {
+    ///
+    /// On `.failed` the text is left on the clipboard: the user's only route to
+    /// it is a manual ⌘V, so restoring over it would throw the dictation away.
+    static func pasteToFocusedApp(_ text: String, holdFor hold: TimeInterval = 0) async -> PasteOutcome {
+        // Snapshot the target *before* touching the clipboard, so the comparison
+        // isn't confused by focus changes our own work might cause.
+        let before = FocusSnapshot.capture()
         let previous = read()
         copy(text)
 
         guard postPasteEvent() else {
-            // The paste never happened, so ⌘V is the user's only route to this
-            // text — leave it on the clipboard and cancel any pending restore.
             restoreLedger.withLock { $0.cancelPending() }
-            return false
+            return .failed
         }
 
-        scheduleRestore(previous: previous, after: max(restoreDelay, hold))
-        return true
+        try? await Task.sleep(nanoseconds: UInt64(verifyDelay * 1_000_000_000))
+        let outcome = FocusSnapshot.compare(before: before, after: FocusSnapshot.capture())
+        Logger.log("Paste outcome: \(outcome) (focus role: \(before.role ?? "none"))")
+
+        switch outcome {
+        case .failed:
+            restoreLedger.withLock { $0.cancelPending() }
+        case .delivered, .unknown:
+            // The wait above already covered `restoreDelay`, so only a
+            // configured hold delays the restore any further.
+            scheduleRestore(previous: previous, after: max(0, max(restoreDelay, hold) - verifyDelay))
+        }
+        return outcome
     }
 
     /// Restore `previous` after `delay`. The ledger keeps the original value
@@ -163,13 +312,17 @@ enum Clipboard {
     ///
     /// Returns false only when both routes failed, i.e. the text did not reach
     /// the focused app and has to be recovered by the user.
+    ///
+    /// Never applies the clipboard hold: live mode inserts many small chunks, and
+    /// parking each one on the clipboard for seconds would trample whatever the
+    /// user has copied.
     @discardableResult
-    static func typeText(_ text: String) -> Bool {
+    static func typeText(_ text: String) async -> Bool {
         guard !text.isEmpty else { return true }
         if insertIntoFocusedElement(text) { return true }
 
         Logger.log("Focused element does not support direct text insertion; using paste fallback")
-        return pasteToFocusedApp(text)
+        return await pasteToFocusedApp(text) != .failed
     }
 
     /// Replace the current selection (or the zero-length insertion-point
