@@ -75,7 +75,9 @@ hotkey = "cmd_r"         # cmd, cmd_r, alt, alt_r, ctrl, ctrl_r
 
 **When text doesn't land**, a bubble appears at the bottom of the screen with the transcription and a Copy button. It goes away after about six seconds (a little longer while the pointer is over it) and never takes keyboard focus, so you can hit Copy and then ⌘V straight into the app you were dictating into. A synthetic ⌘V reports nothing back, so delivery is checked against the focused element afterwards: if there was nothing focused that accepts text — a Finder window, the desktop, a plain web page — that counts as a failure and you get the bubble.
 
-**Keep on clipboard** (Settings → Keep on clipboard: Off / 5 / 10 seconds) leaves the transcription on the clipboard for that long, so a manual ⌘V always works; afterwards whatever you had copied before comes back. This applies to one-shot mode only — with live insertion on, the clipboard is never touched, so dictating can't interfere with what you have copied. **Copy Latest** in the menu bar puts the last transcription back on the clipboard for good, live mode included.
+**Keep on clipboard** (Settings → Keep on clipboard: Off / 5 / 10 seconds) leaves the transcription on the clipboard for that long, so a manual ⌘V always works; afterwards whatever you had copied before comes back. In live mode it covers the finished transcription once, on release — never the individual chunks, which would trample your clipboard while you were still speaking. **Copy Latest** in the menu bar puts the last transcription back on the clipboard for good.
+
+Text pasted into a terminal may look selected afterwards: that's zsh highlighting bracketed pastes, not ainstype. It clears on the next keypress; `zle_highlight=(paste:none)` in `~/.zshrc` turns it off.
 
 The **History** tab (menu bar → Recent Transcriptions…, or the Dictionary window) keeps the last five transcriptions so you can copy text back if a paste didn't land in the focused app.
 

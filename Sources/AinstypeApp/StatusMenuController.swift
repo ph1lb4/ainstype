@@ -385,14 +385,12 @@ class StatusMenuController {
     }
 
     /// After a live session: surface anything that went wrong in a bubble the
-    /// user can copy from.
+    /// user can copy from, and apply the clipboard hold to the finished
+    /// transcript.
     ///
-    /// Live mode deliberately leaves the clipboard alone — the clipboard hold
-    /// does not apply here. Chunked insertion writes straight into the focused
-    /// element, so parking the transcript on the clipboard afterwards would
-    /// replace whatever the user had copied while they were still dictating and
-    /// pasting other things. Use "Copy Latest" to get a live transcript onto the
-    /// clipboard on purpose.
+    /// The hold covers the *whole transcript once*, never the individual chunks:
+    /// parking each chunk on the clipboard for seconds while the user is still
+    /// dictating trampled whatever they had copied.
     private func reportLiveOutcome(transcript: String, finishError: String?) {
         if liveInsertFailed {
             liveInsertFailed = false
@@ -413,6 +411,17 @@ class StatusMenuController {
                 copyText: transcript.isEmpty ? nil : transcript,
                 note: transcript.isEmpty ? nil : "Copy what was transcribed so far."
             )
+            return
+        }
+
+        // Live mode inserts text directly and leaves the clipboard alone, so the
+        // finished transcript has to be put there explicitly for the hold window.
+        // Only when the user asked for it — off by default, the clipboard stays
+        // untouched throughout.
+        let hold = config.clipboardHoldDuration
+        if hold > 0, !transcript.isEmpty {
+            Clipboard.copyAndHold(transcript, for: hold)
+            Logger.log("Live transcript held on clipboard for \(Int(hold))s")
         }
     }
 
