@@ -337,7 +337,7 @@ final class LiveTextAssemblerTests: XCTestCase {
 
 final class RestoreLedgerTests: XCTestCase {
     func testSinglePasteRestoresPreviousOnce() {
-        var ledger = RestoreLedger()
+        var ledger = RestoreLedger<String>()
         let gen = ledger.recordPaste(previousClipboard: "user data")
         XCTAssertEqual(ledger.takeRestore(for: gen), "user data")
         XCTAssertNil(ledger.takeRestore(for: gen), "restore must be one-shot")
@@ -347,7 +347,7 @@ final class RestoreLedgerTests: XCTestCase {
     /// nothing, and the second must restore the *original* user clipboard, not
     /// the first transcription it happened to find on the pasteboard.
     func testRapidPastesRestoreOriginalClipboardExactlyOnce() {
-        var ledger = RestoreLedger()
+        var ledger = RestoreLedger<String>()
         let gen1 = ledger.recordPaste(previousClipboard: "user data")
         let gen2 = ledger.recordPaste(previousClipboard: "transcription one")
         XCTAssertNil(ledger.takeRestore(for: gen1), "superseded timer must not restore")
@@ -355,7 +355,7 @@ final class RestoreLedgerTests: XCTestCase {
     }
 
     func testEmptyOriginalClipboardIsNotRestored() {
-        var ledger = RestoreLedger()
+        var ledger = RestoreLedger<String>()
         let gen = ledger.recordPaste(previousClipboard: nil)
         XCTAssertNil(ledger.takeRestore(for: gen))
     }
@@ -364,7 +364,7 @@ final class RestoreLedgerTests: XCTestCase {
     /// restore timer already in flight (from the paste that failed, or from a
     /// clipboard hold) must not fire afterwards and throw that text away.
     func testCancelPendingNeutralizesInFlightRestore() {
-        var ledger = RestoreLedger()
+        var ledger = RestoreLedger<String>()
         let gen = ledger.recordPaste(previousClipboard: "user data")
         ledger.cancelPending()
         XCTAssertNil(ledger.takeRestore(for: gen), "cancelled restore must not fire")
@@ -373,11 +373,57 @@ final class RestoreLedgerTests: XCTestCase {
     /// Cancelling must not wedge the ledger: the next paste still gets its own
     /// working restore.
     func testPasteAfterCancelStillRestores() {
-        var ledger = RestoreLedger()
+        var ledger = RestoreLedger<String>()
         _ = ledger.recordPaste(previousClipboard: "user data")
         ledger.cancelPending()
         let gen = ledger.recordPaste(previousClipboard: "later clipboard")
         XCTAssertEqual(ledger.takeRestore(for: gen), "later clipboard")
+    }
+}
+
+// MARK: - Clipboard contents
+
+final class ClipboardContentsTests: XCTestCase {
+    /// Non-text clipboard content (images, rich text, several items) must come
+    /// back intact after a paste, and the restore must be hidden from
+    /// clipboard managers.
+    func testRestoreBringsBackEveryItemAndType() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("ainstype-test-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x01, 0x02])
+        let rtf = Data("{\\rtf1 bold}".utf8)
+        let first = NSPasteboardItem()
+        first.setData(png, forType: .png)
+        let second = NSPasteboardItem()
+        second.setString("plain", forType: .string)
+        second.setData(rtf, forType: .rtf)
+        pasteboard.clearContents()
+        pasteboard.writeObjects([first, second])
+
+        let saved = ClipboardContents.capture(from: pasteboard)
+        pasteboard.clearContents()
+        pasteboard.setString("transcription", forType: .string)
+        saved.restore(to: pasteboard)
+
+        let items = pasteboard.pasteboardItems ?? []
+        XCTAssertEqual(items.count, 2)
+        XCTAssertEqual(items.first?.data(forType: .png), png)
+        XCTAssertEqual(items.last?.string(forType: .string), "plain")
+        XCTAssertEqual(items.last?.data(forType: .rtf), rtf)
+        XCTAssertNotNil(items.first?.data(forType: ClipboardContents.transientType))
+    }
+
+    func testRestoringEmptyClipboardClearsTranscription() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("ainstype-test-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        pasteboard.clearContents()
+
+        let saved = ClipboardContents.capture(from: pasteboard)
+        pasteboard.setString("transcription", forType: .string)
+        saved.restore(to: pasteboard)
+
+        XCTAssertNil(pasteboard.string(forType: .string))
     }
 }
 
