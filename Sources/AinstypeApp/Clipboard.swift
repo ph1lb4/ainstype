@@ -9,16 +9,16 @@ import os
 /// "previous" clipboard, and the first restore could fire mid-paste. The ledger
 /// keeps the original user clipboard across overlapping pastes and only lets
 /// the latest paste's timer restore it.
-struct RestoreLedger {
+struct RestoreLedger<Value> {
     private(set) var generation = 0
     private var hasPending = false
-    private var pendingValue: String?
+    private var pendingValue: Value?
 
     /// Record a paste about to happen; `previousClipboard` is what the
     /// clipboard held just before. Returns a generation token for `takeRestore`.
     /// While a restore is pending, the clipboard holds *our* transcription, so
     /// only the first overlapping paste captures the user's real clipboard.
-    mutating func recordPaste(previousClipboard: String?) -> Int {
+    mutating func recordPaste(previousClipboard: Value?) -> Int {
         if !hasPending {
             hasPending = true
             pendingValue = previousClipboard
@@ -30,7 +30,7 @@ struct RestoreLedger {
     /// The value the timer for paste `generation` should restore, or nil to do
     /// nothing (superseded by a newer paste, nothing pending, or the original
     /// clipboard was empty).
-    mutating func takeRestore(for generation: Int) -> String? {
+    mutating func takeRestore(for generation: Int) -> Value? {
         guard generation == self.generation, hasPending else { return nil }
         hasPending = false
         defer { pendingValue = nil }
@@ -129,10 +129,18 @@ struct FocusSnapshot {
 
     // MARK: - Accessibility reads
 
-    private static func focusedElement() -> AXUIElement? {
+    /// The system-wide query intermittently fails with `cannotComplete`, so
+    /// fall back to asking the frontmost app directly.
+    static func focusedElement() -> AXUIElement? {
+        if let element = focusedElement(of: AXUIElementCreateSystemWide()) { return element }
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        return focusedElement(of: AXUIElementCreateApplication(app.processIdentifier))
+    }
+
+    private static func focusedElement(of container: AXUIElement) -> AXUIElement? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
-            AXUIElementCreateSystemWide(),
+            container,
             kAXFocusedUIElementAttribute as CFString,
             &value
         ) == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID()
@@ -177,6 +185,39 @@ struct FocusSnapshot {
     }
 }
 
+/// Everything on the general pasteboard, every item in every type, so a
+/// restore brings back images, files and rich text, not just plain text.
+struct ClipboardContents {
+    /// nspasteboard.org marker that tells clipboard managers to skip an entry.
+    static let transientType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+
+    private let items: [[NSPasteboard.PasteboardType: Data]]
+
+    static func capture(from pasteboard: NSPasteboard = .general) -> ClipboardContents {
+        let items = (pasteboard.pasteboardItems ?? []).map { item in
+            var data: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                if let value = item.data(forType: type) { data[type] = value }
+            }
+            return data
+        }
+        return ClipboardContents(items: items)
+    }
+
+    /// Put the contents back. Marked transient and local so clipboard managers
+    /// don't record the user's own clipboard a second time.
+    func restore(to pasteboard: NSPasteboard = .general) {
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
+        let restored = items.map { data -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, value) in data { item.setData(value, forType: type) }
+            return item
+        }
+        restored.first?.setData(Data(), forType: Self.transientType)
+        if !restored.isEmpty { pasteboard.writeObjects(restored) }
+    }
+}
+
 enum Clipboard {
     /// Virtual keycode for the V key (Cmd+V paste).
     private static let vKeyCode: CGKeyCode = 9
@@ -201,9 +242,13 @@ enum Clipboard {
         pasteboard.setString(text, forType: .string)
     }
 
-    /// Read current clipboard contents.
-    static func read() -> String? {
-        NSPasteboard.general.string(forType: .string)
+    /// Copy text that is only on the clipboard for the moment of a synthetic
+    /// paste: kept off Universal Clipboard and skipped by clipboard managers.
+    private static func copyTemporarily(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
+        pasteboard.setString(text, forType: .string)
+        pasteboard.setData(Data(), forType: ClipboardContents.transientType)
     }
 
     /// Copy `text` and keep it there: cancels any pending restore from an
@@ -220,7 +265,7 @@ enum Clipboard {
     /// comes back. A `duration` of 0 or less pins the text instead of holding it.
     static func copyAndHold(_ text: String, for duration: TimeInterval) {
         guard duration > 0 else { return copyPinned(text) }
-        let previous = read()
+        let previous = ClipboardContents.capture()
         copy(text)
         scheduleRestore(previous: previous, after: duration)
     }
@@ -246,7 +291,7 @@ enum Clipboard {
         return true
     }
 
-    private static let restoreLedger = OSAllocatedUnfairLock(initialState: RestoreLedger())
+    private static let restoreLedger = OSAllocatedUnfairLock(initialState: RestoreLedger<ClipboardContents>())
 
     /// Copy text to the clipboard, post ⌘V, check whether it actually landed,
     /// then restore the user's previous clipboard.
@@ -255,17 +300,17 @@ enum Clipboard {
     /// clipboard after the paste, so the user can repeat the paste by hand if the
     /// automatic one didn't land where they wanted.
     ///
-    /// On `.failed` the text is left on the clipboard: the user's only route to
-    /// it is a manual ⌘V, so restoring over it would throw the dictation away.
+    /// The user's clipboard is restored in every case, including `.failed`;
+    /// the caller offers the text through the recovery bubble instead.
     static func pasteToFocusedApp(_ text: String, holdFor hold: TimeInterval = 0) async -> PasteOutcome {
         // Snapshot the target *before* touching the clipboard, so the comparison
         // isn't confused by focus changes our own work might cause.
         let before = FocusSnapshot.capture()
-        let previous = read()
-        copy(text)
+        let previous = ClipboardContents.capture()
+        if hold > 0 { copy(text) } else { copyTemporarily(text) }
 
         guard postPasteEvent() else {
-            restoreLedger.withLock { $0.cancelPending() }
+            scheduleRestore(previous: previous, after: 0)
             return .failed
         }
 
@@ -273,33 +318,26 @@ enum Clipboard {
         let outcome = FocusSnapshot.compare(before: before, after: FocusSnapshot.capture())
         Logger.log("Paste outcome: \(outcome) (focus role: \(before.role ?? "none"))")
 
-        switch outcome {
-        case .failed:
-            restoreLedger.withLock { $0.cancelPending() }
-        case .delivered, .unknown:
-            // The wait above already covered `restoreDelay`, so only a
-            // configured hold delays the restore any further.
-            scheduleRestore(previous: previous, after: max(0, max(restoreDelay, hold) - verifyDelay))
-        }
+        // The wait above already covered `restoreDelay`, so only a configured
+        // hold delays the restore any further.
+        scheduleRestore(previous: previous, after: max(0, max(restoreDelay, hold) - verifyDelay))
         return outcome
     }
 
     /// Restore `previous` after `delay`. The ledger keeps the original value
     /// across rapid overlapping pastes and lets only the newest one's timer
     /// restore it.
-    private static func scheduleRestore(previous: String?, after delay: TimeInterval) {
+    private static func scheduleRestore(previous: ClipboardContents, after delay: TimeInterval) {
         let generation = restoreLedger.withLock { $0.recordPaste(previousClipboard: previous) }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            if let value = restoreLedger.withLock({ $0.takeRestore(for: generation) }) {
-                copy(value)
-            }
+            restoreLedger.withLock { $0.takeRestore(for: generation) }?.restore()
         }
     }
 
-    /// Insert `text` into the focused editable element. Used by live mode, which
-    /// inserts many small chunks as words are confirmed.
+    /// Insert `text` into the focused editable element. Used for every
+    /// dictation, in live mode once per confirmed chunk.
     ///
-    /// Live mode normally writes the focused element's selected-text attribute.
+    /// It normally writes the focused element's selected-text attribute.
     /// That is an atomic insert/selection replacement, preserves boundary spaces,
     /// and leaves the clipboard untouched. It also avoids synthetic keyboard
     /// events while the push-to-talk modifier is physically held.
@@ -313,9 +351,7 @@ enum Clipboard {
     /// Returns false only when both routes failed, i.e. the text did not reach
     /// the focused app and has to be recovered by the user.
     ///
-    /// Never applies the clipboard hold: live mode inserts many small chunks, and
-    /// parking each one on the clipboard for seconds would trample whatever the
-    /// user has copied.
+    /// Never applies the clipboard hold; callers apply it to the finished text.
     @discardableResult
     static func typeText(_ text: String) async -> Bool {
         guard !text.isEmpty else { return true }
@@ -328,17 +364,7 @@ enum Clipboard {
     /// Replace the current selection (or the zero-length insertion-point
     /// selection) in the focused editable accessibility element.
     private static func insertIntoFocusedElement(_ text: String) -> Bool {
-        let systemWide = AXUIElementCreateSystemWide()
-        var focusedValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            systemWide,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedValue
-        ) == .success,
-        let focusedValue
-        else { return false }
-
-        let focused = focusedValue as! AXUIElement
+        guard let focused = FocusSnapshot.focusedElement() else { return false }
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(
             focused,
@@ -354,6 +380,8 @@ enum Clipboard {
             text as CFString
         ) == .success
     }
+
+    static let insertFailedNote = "Nothing was focused that accepts text. Click Copy, then press \u{2318}V in a text field."
 
     /// Check if the app has Accessibility permission (needed for CGEvent paste).
     static func checkAccessibility() -> Bool {

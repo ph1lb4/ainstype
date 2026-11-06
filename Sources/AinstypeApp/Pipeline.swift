@@ -3,7 +3,7 @@ import Foundation
 import os
 import WhisperKit
 
-/// Orchestrates the full pipeline: transcribe → dictionary → paste.
+/// Orchestrates the full pipeline: transcribe → dictionary → insert.
 class Pipeline {
     private let config: Config
     fileprivate let whisperKitBox = OSAllocatedUnfairLock<WhisperKit?>(initialState: nil)
@@ -217,20 +217,20 @@ class Pipeline {
         let text = dictionary.applyReplacements(rawText)
         history.add(text)
 
-        // Paste to focused app
-        log("Pasting result...")
+        log("Inserting result...")
         if config.autoPaste {
-            let outcome = await Clipboard.pasteToFocusedApp(text, holdFor: config.clipboardHoldDuration)
-            if outcome == .failed {
-                log("Paste did not land in the focused app")
-                Clipboard.copyPinned(text)
+            guard await Clipboard.typeText(text) else {
+                log("Text did not land in the focused app")
                 RecoveryBubble.present(
-                    title: "Couldn\u{2019}t paste into the app",
+                    title: "Couldn\u{2019}t insert text into the app",
                     message: text,
                     copyText: text,
-                    note: "Nothing was focused that accepts text. It\u{2019}s on your clipboard \u{2014} click into a text field and press \u{2318}V."
+                    note: Clipboard.insertFailedNote
                 )
+                return
             }
+            let hold = config.clipboardHoldDuration
+            if hold > 0 { Clipboard.copyAndHold(text, for: hold) }
         } else {
             // Clipboard-only mode: the text must stay put until the user pastes it.
             Clipboard.copyPinned(text)

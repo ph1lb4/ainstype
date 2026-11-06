@@ -394,12 +394,11 @@ class StatusMenuController {
     private func reportLiveOutcome(transcript: String, finishError: String?) {
         if liveInsertFailed {
             liveInsertFailed = false
-            Clipboard.copyPinned(transcript)
             RecoveryBubble.present(
                 title: "Couldn\u{2019}t insert text into the app",
                 message: transcript,
                 copyText: transcript.isEmpty ? nil : transcript,
-                note: "Nothing was focused that accepts text. It\u{2019}s on your clipboard \u{2014} click into a text field and press \u{2318}V."
+                note: Clipboard.insertFailedNote
             )
             return
         }
