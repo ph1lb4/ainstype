@@ -459,6 +459,13 @@ final class FocusSnapshotTests: XCTestCase {
         XCTAssertEqual(FocusSnapshot.compare(before: before, after: before), .failed)
     }
 
+    /// Custom-drawn editors expose only their window; a paste there is not provably lost.
+    func testUnchangedFocusedWindowIsUnknown() {
+        let el = element()
+        let before = FocusSnapshot(element: el, role: "AXWindow", textCapable: false, characterCount: nil, caretLocation: nil)
+        XCTAssertEqual(FocusSnapshot.compare(before: before, after: before), .unknown)
+    }
+
     func testGrowingCharacterCountIsDelivered() {
         let el = element()
         let outcome = FocusSnapshot.compare(

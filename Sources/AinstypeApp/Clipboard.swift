@@ -123,8 +123,11 @@ struct FocusSnapshot {
 
         // Nothing changed. Only call that a failure when the target wasn't
         // something that takes text in the first place — that's the case the
-        // user can act on ("you were focused on a window, not a text field").
-        return before.textCapable ? .unknown : .failed
+        // user can act on ("you were focused on a button, not a text field").
+        // A focused window means the app exposes no element for its text view
+        // (custom-drawn editors), so no change proves nothing there.
+        if before.textCapable || before.role == kAXWindowRole { return .unknown }
+        return .failed
     }
 
     // MARK: - Accessibility reads
@@ -135,6 +138,20 @@ struct FocusSnapshot {
         if let element = focusedElement(of: AXUIElementCreateSystemWide()) { return element }
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
         return focusedElement(of: AXUIElementCreateApplication(app.processIdentifier))
+    }
+
+    /// Web content (browsers, Electron apps) can accept a selected-text write
+    /// and still insert nothing, so it must use the paste path.
+    static func isInWebContent(_ element: AXUIElement) -> Bool {
+        var current = element
+        for _ in 0..<40 {
+            if string(current, kAXRoleAttribute) == "AXWebArea" { return true }
+            var parent: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &parent) == .success,
+                  let parent, CFGetTypeID(parent) == AXUIElementGetTypeID() else { return false }
+            current = parent as! AXUIElement
+        }
+        return false
     }
 
     private static func focusedElement(of container: AXUIElement) -> AXUIElement? {
@@ -364,7 +381,8 @@ enum Clipboard {
     /// Replace the current selection (or the zero-length insertion-point
     /// selection) in the focused editable accessibility element.
     private static func insertIntoFocusedElement(_ text: String) -> Bool {
-        guard let focused = FocusSnapshot.focusedElement() else { return false }
+        guard let focused = FocusSnapshot.focusedElement(),
+              !FocusSnapshot.isInWebContent(focused) else { return false }
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(
             focused,
