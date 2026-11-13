@@ -215,6 +215,14 @@ enum AudioDevices {
         return "[\(name) \(transport) \(Int(rate))Hz vol=\(vol.map { String(format: "%.2f", $0) } ?? "n/a")]"
     }
 
+    static func defaultInputID() -> AudioDeviceID? {
+        defaultDevice(kAudioHardwarePropertyDefaultInputDevice)
+    }
+
+    static func name(of id: AudioDeviceID) -> String {
+        "\(stringProperty(id, kAudioObjectPropertyName) ?? "?") (\(fourCC(transportType(id))))"
+    }
+
     static func defaultInputName() -> String {
         guard let id = defaultDevice(kAudioHardwarePropertyDefaultInputDevice) else { return "none" }
         return "\(stringProperty(id, kAudioObjectPropertyName) ?? "?") (\(fourCC(transportType(id))))"
@@ -249,41 +257,35 @@ enum AudioDevices {
     }
 }
 
-/// Records audio from the default microphone using AVAudioEngine.
+/// Records audio from one input device with an input-only CoreAudio HAL unit.
 /// Output: 16kHz mono Float32 array (what Whisper expects).
+///
+/// `AVAudioEngine` is not used: touching its `inputNode` opens the system default
+/// input before another device can be selected, and its output side stays bound to
+/// the default output. With Bluetooth headphones that puts the headset into the
+/// call profile even when the built-in mic is selected. This unit opens only the
+/// selected input device and never touches the output device.
 class AudioRecorder {
     let sampleRate: Double
     /// Which microphone to capture from. Read on each `start()`, so changing it
-    /// from Settings takes effect on the next recording. `StatusMenuController`
-    /// sets this from config at launch (system default unless the user picks a
-    /// specific device — e.g. "builtin" to keep Bluetooth headphones out of
-    /// call mode).
+    /// from Settings takes effect on the next recording.
     var inputDevice: InputDeviceSelection = .systemDefault
-    private var engine: AVAudioEngine?
+    private var capture: InputCapture?
     private var frames: [[Float]] = []
     private let lock = NSLock()
     private var isRecording = false
-    /// Holds Bluetooth output at its music volume while recording, so opening the
-    /// mic doesn't make macOS swap in the headset's separate "call" volume.
 
     init(sampleRate: Int = 16000) {
         self.sampleRate = Double(sampleRate)
     }
 
-    /// Briefly spin up CoreAudio to warm its device/format caches so the first
-    /// real `start()` doesn't pay the cold-start cost, then tear everything down
-    /// again. Holding the engine alive after this would keep the input AU open
-    /// and cause other apps to duck as if a call were active — so we throw the
-    /// engine away. CoreAudio's internal caches survive for long enough that
-    /// the next `start()` is still fast.
+    /// Load the HAL audio component so the first `start()` is fast. Opens no device.
     func prewarm() {
         Logger.log("prewarm: output \(AudioDevices.defaultOutputState()), default-input \(AudioDevices.defaultInputName())")
-        let warm = AVAudioEngine()
-        // Pin to the configured device before touching the input so we don't open
-        // the default (possibly Bluetooth) mic here and trip a profile switch.
-        applyInputDevice(to: warm.inputNode)
-        _ = warm.inputNode.outputFormat(forBus: 0)
-        warm.stop()
+        _ = AudioDevices.inputDevices()
+        if let unit = InputCapture.makeUnit() {
+            AudioComponentInstanceDispose(unit)
+        }
         Logger.log("prewarm done: output \(AudioDevices.defaultOutputState())")
     }
 
@@ -294,12 +296,6 @@ class AudioRecorder {
         }
     }
 
-    /// Begin recording from the default microphone.
-    ///
-    /// The engine is constructed fresh on each start and fully released on stop —
-    /// merely holding an `AVAudioEngine` whose `inputNode` has been touched keeps
-    /// the CoreAudio input unit alive, which other apps interpret as an active
-    /// call and respond to by ducking their playback.
     func start() throws {
         lock.lock()
         if isRecording { lock.unlock(); return }
@@ -307,82 +303,38 @@ class AudioRecorder {
         isRecording = true
         lock.unlock()
 
-        Logger.log("start: default-input \(AudioDevices.defaultInputName()), output \(AudioDevices.defaultOutputState())")
-        let engine = AVAudioEngine()
-        self.engine = engine
-        let inputNode = engine.inputNode
-        // Pin the capture device before reading the input format — the format
-        // (sample rate, channels) depends on which device is selected.
-        applyInputDevice(to: inputNode)
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-
-        // We need 16kHz mono for Whisper
-        guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sampleRate,
-            channels: 1,
-            interleaved: false
-        ), let tapConverter = TapConverter(from: inputFormat, to: targetFormat) else {
-            // Roll back so a format failure doesn't leave us wedged, and abort
-            // rather than capture wrong-rate audio Whisper can't use.
-            self.engine = nil
-            lock.lock()
-            isRecording = false
-            lock.unlock()
-            throw RecorderError.formatError
+        let deviceID: AudioDeviceID
+        if inputDevice != .systemDefault, let resolved = AudioDevices.resolve(inputDevice) {
+            deviceID = resolved
+        } else if let fallback = AudioDevices.defaultInputID() {
+            if inputDevice != .systemDefault {
+                Logger.error("Input device '\(inputDevice.configValue)' not found — using system default")
+            }
+            deviceID = fallback
+        } else {
+            rollBack()
+            throw RecorderError.noInputDevice
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            guard let self, let data = tapConverter.convert(buffer) else { return }
-            self.lock.lock()
-            self.frames.append(data)
-            self.lock.unlock()
-        }
-
+        Logger.log("start: device \(AudioDevices.name(of: deviceID)), output \(AudioDevices.defaultOutputState())")
         do {
-            try engine.start()
+            capture = try InputCapture(deviceID: deviceID, targetSampleRate: sampleRate) { [weak self] samples in
+                guard let self else { return }
+                self.lock.lock()
+                self.frames.append(samples)
+                self.lock.unlock()
+            }
         } catch {
-            // Roll back state so a failed start doesn't leave us wedged.
-            self.engine = nil
-            lock.lock()
-            isRecording = false
-            lock.unlock()
+            rollBack()
             throw error
         }
         Logger.log("AudioRecorder started; output \(AudioDevices.defaultOutputState())")
-        // Sample the output device shortly after — macOS applies any call-mode
-        // switch asynchronously (~0.4s after the input opens).
-        for delay in [0.5, 1.2] {
-            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard self?.isRecording == true else { return }
-                Logger.log("  +\(delay)s output \(AudioDevices.defaultOutputState())")
-            }
-        }
     }
 
-    /// Point the engine's input at the configured device. A no-op for
-    /// `.systemDefault`; for a specific/built-in device that can't be resolved
-    /// (unplugged, no built-in mic) we log and fall back to the system default
-    /// rather than fail the recording.
-    private func applyInputDevice(to inputNode: AVAudioInputNode) {
-        guard inputDevice != .systemDefault else { return }
-        guard let deviceID = AudioDevices.resolve(inputDevice) else {
-            Logger.error("Input device '\(inputDevice.configValue)' not found — using system default")
-            return
-        }
-        guard let audioUnit = inputNode.audioUnit else { return }
-        var device = deviceID
-        let status = AudioUnitSetProperty(
-            audioUnit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &device,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        if status != noErr {
-            Logger.error("Failed to set input device (status \(status)) — using system default")
-        }
+    private func rollBack() {
+        lock.lock()
+        isRecording = false
+        lock.unlock()
     }
 
     /// Snapshot of all audio captured so far, without stopping recording or
@@ -395,20 +347,15 @@ class AudioRecorder {
         return snapshot.flatMap { $0 }
     }
 
-    /// Stop recording and return concatenated audio samples.
+    /// Stop recording, release the device and return concatenated audio samples.
     func stop() -> [Float] {
         lock.lock()
         if !isRecording { lock.unlock(); return [] }
         isRecording = false
         lock.unlock()
 
-        if let engine {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
-        }
-        // Drop the engine so the CoreAudio input unit is released and other
-        // apps stop treating the system as if a call is active.
-        engine = nil
+        capture?.stop()
+        capture = nil
         Logger.log("stop: output \(AudioDevices.defaultOutputState())")
 
         lock.lock()
@@ -423,5 +370,228 @@ class AudioRecorder {
 
     enum RecorderError: Error {
         case formatError
+        case noInputDevice
+        case coreAudio(String, OSStatus)
     }
+}
+
+/// Fixed-size sample buffer between the audio thread (writes) and a normal
+/// queue (reads). Allocates only in `init`; the lock is held only for copies.
+final class SampleRing {
+    private let storage: UnsafeMutablePointer<Float>
+    private let capacity: Int
+    private var readIndex = 0
+    private var count = 0
+    private var lock = os_unfair_lock()
+    private var dropped = 0
+
+    var droppedSamples: Int {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        return dropped
+    }
+
+    init(capacity: Int) {
+        self.capacity = capacity
+        storage = .allocate(capacity: capacity)
+    }
+
+    deinit { storage.deallocate() }
+
+    /// Called on the audio thread. Samples that do not fit are dropped and counted.
+    func write(_ source: UnsafePointer<Float>, count frames: Int) {
+        os_unfair_lock_lock(&lock)
+        let accepted = min(frames, capacity - count)
+        var writeIndex = (readIndex + count) % capacity
+        var copied = 0
+        while copied < accepted {
+            let chunk = min(accepted - copied, capacity - writeIndex)
+            (storage + writeIndex).update(from: source + copied, count: chunk)
+            copied += chunk
+            writeIndex = (writeIndex + chunk) % capacity
+        }
+        count += accepted
+        dropped += frames - accepted
+        os_unfair_lock_unlock(&lock)
+    }
+
+    /// Moves all buffered samples into `destination` and returns how many were moved.
+    func read(into destination: UnsafeMutablePointer<Float>, maxCount: Int) -> Int {
+        os_unfair_lock_lock(&lock)
+        let taken = min(count, maxCount)
+        var copied = 0
+        while copied < taken {
+            let chunk = min(taken - copied, capacity - readIndex)
+            (destination + copied).update(from: storage + readIndex, count: chunk)
+            copied += chunk
+            readIndex = (readIndex + chunk) % capacity
+        }
+        count -= taken
+        os_unfair_lock_unlock(&lock)
+        return taken
+    }
+}
+
+/// One running input-only HAL unit bound to a single device. Starts in `init`,
+/// releases the device in `stop()`. The audio thread only copies samples into a
+/// ring buffer; resampling runs on a normal queue.
+final class InputCapture {
+    private var unit: AudioUnit?
+    private let renderBuffer: AVAudioPCMBuffer
+    private let drainBuffer: AVAudioPCMBuffer
+    private let ring: SampleRing
+    private let converter: TapConverter
+    private let onSamples: ([Float]) -> Void
+    private let queue = DispatchQueue(label: "com.ainstype.input-capture")
+    private var drainTimer: DispatchSourceTimer?
+    private var reportedDrops = 0
+    private static let inputBus: AudioUnitElement = 1
+    private static let outputBus: AudioUnitElement = 0
+    private static let maxFrames: AVAudioFrameCount = 8192
+    private static let ringSeconds: Double = 2
+    private static let drainInterval: DispatchTimeInterval = .milliseconds(20)
+
+    static func makeUnit() -> AudioUnit? {
+        var description = AudioComponentDescription(
+            componentType: kAudioUnitType_Output,
+            componentSubType: kAudioUnitSubType_HALOutput,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+        guard let component = AudioComponentFindNext(nil, &description) else { return nil }
+        var unit: AudioUnit?
+        guard AudioComponentInstanceNew(component, &unit) == noErr else { return nil }
+        return unit
+    }
+
+    init(deviceID: AudioDeviceID, targetSampleRate: Double, onSamples: @escaping ([Float]) -> Void) throws {
+        self.onSamples = onSamples
+        guard let unit = InputCapture.makeUnit() else {
+            throw AudioRecorder.RecorderError.coreAudio("create unit", -1)
+        }
+
+        func check(_ status: OSStatus, _ step: String) throws {
+            if status != noErr {
+                AudioComponentInstanceDispose(unit)
+                throw AudioRecorder.RecorderError.coreAudio(step, status)
+            }
+        }
+
+        // The output side must be off before the device is set, or the unit binds
+        // to the default output device as well.
+        var on: UInt32 = 1
+        var off: UInt32 = 0
+        let flagSize = UInt32(MemoryLayout<UInt32>.size)
+        try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, InputCapture.inputBus, &on, flagSize), "enable input")
+        try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, InputCapture.outputBus, &off, flagSize), "disable output")
+
+        var device = deviceID
+        try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size)), "set device")
+
+        var deviceFormat = AudioStreamBasicDescription()
+        var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        try check(AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, InputCapture.inputBus, &deviceFormat, &formatSize), "read device format")
+
+        // The HAL unit converts sample format and channel count but not sample
+        // rate, so capture mono Float32 at the device rate and resample after.
+        let ringCapacity = Int(deviceFormat.mSampleRate * InputCapture.ringSeconds)
+        guard deviceFormat.mSampleRate > 0,
+              let captureFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: deviceFormat.mSampleRate, channels: 1, interleaved: false),
+              let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: targetSampleRate, channels: 1, interleaved: false),
+              let converter = TapConverter(from: captureFormat, to: targetFormat),
+              let renderBuffer = AVAudioPCMBuffer(pcmFormat: captureFormat, frameCapacity: InputCapture.maxFrames),
+              let drainBuffer = AVAudioPCMBuffer(pcmFormat: captureFormat, frameCapacity: AVAudioFrameCount(ringCapacity)) else {
+            AudioComponentInstanceDispose(unit)
+            throw AudioRecorder.RecorderError.formatError
+        }
+        self.converter = converter
+        self.renderBuffer = renderBuffer
+        self.drainBuffer = drainBuffer
+        self.ring = SampleRing(capacity: ringCapacity)
+
+        var clientFormat = captureFormat.streamDescription.pointee
+        try check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, InputCapture.inputBus, &clientFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)), "set client format")
+
+        var maxFrames = UInt32(InputCapture.maxFrames)
+        try check(AudioUnitSetProperty(unit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFrames, flagSize), "set max frames")
+
+        var callback = AURenderCallbackStruct(
+            inputProc: { refCon, flags, timeStamp, bus, frameCount, _ in
+                let capture = Unmanaged<InputCapture>.fromOpaque(refCon).takeUnretainedValue()
+                return capture.render(flags: flags, timeStamp: timeStamp, bus: bus, frameCount: frameCount)
+            },
+            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
+        )
+        try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &callback, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "set input callback")
+
+        try check(AudioUnitInitialize(unit), "initialize")
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + InputCapture.drainInterval, repeating: InputCapture.drainInterval)
+        timer.setEventHandler { [weak self] in self?.drain() }
+        timer.resume()
+        drainTimer = timer
+
+        self.unit = unit
+        let startStatus = AudioOutputUnitStart(unit)
+        if startStatus != noErr {
+            self.unit = nil
+            timer.cancel()
+            drainTimer = nil
+            AudioUnitUninitialize(unit)
+            try check(startStatus, "start")
+        }
+    }
+
+    /// Runs on the audio thread: no allocation, no conversion.
+    private func render(
+        flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+        timeStamp: UnsafePointer<AudioTimeStamp>,
+        bus: UInt32,
+        frameCount: UInt32
+    ) -> OSStatus {
+        guard let unit, frameCount <= renderBuffer.frameCapacity,
+              let channel = renderBuffer.floatChannelData?[0] else { return noErr }
+        renderBuffer.frameLength = frameCount
+        let list = renderBuffer.mutableAudioBufferList
+        list.pointee.mBuffers.mDataByteSize = frameCount * UInt32(MemoryLayout<Float>.size)
+        let status = AudioUnitRender(unit, flags, timeStamp, bus, frameCount, list)
+        if status == noErr {
+            ring.write(channel, count: Int(frameCount))
+        }
+        return status
+    }
+
+    /// Runs on `queue`.
+    private func drain() {
+        guard let channel = drainBuffer.floatChannelData?[0] else { return }
+        let count = ring.read(into: channel, maxCount: Int(drainBuffer.frameCapacity))
+        let dropped = ring.droppedSamples
+        if dropped > reportedDrops {
+            Logger.error("Audio capture dropped \(dropped - reportedDrops) samples")
+            reportedDrops = dropped
+        }
+        guard count > 0 else { return }
+        drainBuffer.frameLength = AVAudioFrameCount(count)
+        if let samples = converter.convert(drainBuffer) {
+            onSamples(samples)
+        }
+    }
+
+    /// Stops the device, then delivers the samples still in the ring buffer.
+    func stop() {
+        guard let unit else { return }
+        AudioOutputUnitStop(unit)
+        AudioUnitUninitialize(unit)
+        AudioComponentInstanceDispose(unit)
+        self.unit = nil
+        queue.sync {
+            drainTimer?.cancel()
+            drainTimer = nil
+            drain()
+        }
+    }
+
+    deinit { stop() }
 }
