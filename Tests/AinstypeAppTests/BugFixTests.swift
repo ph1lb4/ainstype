@@ -636,3 +636,12 @@ final class DictionaryConcurrencyTests: XCTestCase {
         }
     }
 }
+
+final class InsertTargetTests: XCTestCase {
+    func testJetBrainsIDEsUsePasteInsteadOfDirectInsert() {
+        XCTAssertTrue(Clipboard.isUnreliableInsertTarget(bundleID: "com.jetbrains.intellij"))
+        XCTAssertTrue(Clipboard.isUnreliableInsertTarget(bundleID: "com.google.android.studio"))
+        XCTAssertFalse(Clipboard.isUnreliableInsertTarget(bundleID: "com.microsoft.VSCode"))
+        XCTAssertFalse(Clipboard.isUnreliableInsertTarget(bundleID: nil))
+    }
+}
