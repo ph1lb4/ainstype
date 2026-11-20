@@ -33,6 +33,7 @@ The pipeline flows: **hotkey → record → transcribe → dictionary replacemen
 - `RecoveryBubble.swift` — Non-activating floating panel shown bottom-center when a transcription can't be delivered (paste/insert failed, transcription errored) or on "Copy Latest". Shows the text with a Copy button, auto-dismisses after 6s (hard cap 20s, hover suspends the countdown), never steals keyboard focus so ⌘V still goes to the user's app. Timers run in `.common` run loop modes so an open menu can't stall them. Replaces the previous `UNUserNotification` error path.
 - `Config.swift` — TOMLKit-based config, reads `~/.config/ainstype/` files.
 - `LaunchAgent.swift` — Manages `~/Library/LaunchAgents/com.ainstype.menubar.plist` for auto-start at login.
+- `Updater.swift` — Sparkle auto-update (`SUFeedURL` = latest GitHub release `appcast.xml`, key in login Keychain account `ainstype`). Scheduled updates use gentle reminders: never pops a window while recording or unfocused, the menu item turns into "Install Update x.y.z…" instead. Off when `SUPublicEDKey` is missing (`swift run`). Updates ship the slim DMG; `Pipeline` copies a bundled model out of the app (`~/Library/Application Support/ainstype/Models`) so it survives the update.
 - `Logger.swift` — Writes to `os_log` and `~/Library/Logs/ainstype/app.log`.
 
 ## Configuration

@@ -14,3 +14,6 @@ dist/
 
 # Local tooling
 .claude/
+
+# Sparkle update feed (uploaded to the GitHub release)
+appcast.xml

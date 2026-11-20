@@ -7,11 +7,12 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "1.0.0"),
         .package(url: "https://github.com/LebJe/TOMLKit.git", from: "0.6.0"),
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.10.1"),
     ],
     targets: [
         .executableTarget(
             name: "AinstypeApp",
-            dependencies: ["WhisperKit", "TOMLKit"],
+            dependencies: ["WhisperKit", "TOMLKit", "Sparkle"],
             path: "Sources/AinstypeApp"
         ),
         .testTarget(

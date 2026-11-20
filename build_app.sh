@@ -3,10 +3,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-VERSION="0.8.0"
+VERSION="0.9.0"
 APP_NAME="ainstype"
 BUNDLE_NAME="${APP_NAME}.app"
-DMG_NAME="${APP_NAME}-${VERSION}.dmg"
+SPARKLE_BIN=".build/artifacts/sparkle/Sparkle/bin"
+# Sparkle update key: stored in the login Keychain under this account (see README, Updates).
+SPARKLE_ACCOUNT="${SPARKLE_ACCOUNT:-ainstype}"
 # Override with your own when building from a fork:
 #   SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" TEAM_ID=TEAMID ./build_app.sh
 IDENTITY="${SIGN_IDENTITY:-Developer ID Application: Soon Up GmbH (6A2SZH3VT5)}"
@@ -38,6 +40,11 @@ cp "${BUILD_DIR}/AinstypeApp" "${APP_DIR}/Contents/MacOS/AinstypeApp"
 
 # Copy Info.plist
 cp "${INFO_PLIST}" "${APP_DIR}/Contents/Info.plist"
+
+# Embed Sparkle (auto-update). The binary looks for it in Contents/Frameworks.
+mkdir -p "${APP_DIR}/Contents/Frameworks"
+cp -R "${BUILD_DIR}/Sparkle.framework" "${APP_DIR}/Contents/Frameworks/"
+install_name_tool -add_rpath "@executable_path/../Frameworks" "${APP_DIR}/Contents/MacOS/AinstypeApp"
 
 # Copy app icon
 cp "AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
@@ -77,6 +84,13 @@ else
     echo "Skipping model bundle — users will download on first run."
 fi
 
+# The slim build is the one auto-updates download, so it gets its own name.
+if [ "${BUNDLE_MODEL}" = "yes" ]; then
+    DMG_NAME="${APP_NAME}-${VERSION}.dmg"
+else
+    DMG_NAME="${APP_NAME}-${VERSION}-no-model.dmg"
+fi
+
 BINARY_SIZE=$(du -sh "${APP_DIR}/Contents/MacOS/AinstypeApp" | cut -f1)
 echo "Binary size: ${BINARY_SIZE}"
 
@@ -92,10 +106,16 @@ if ! security find-identity -v -p codesigning | grep -q "${IDENTITY}"; then
     exit 1
 fi
 
-codesign --force --deep --options runtime \
-    --entitlements "${ENTITLEMENTS}" \
-    --sign "${IDENTITY}" \
-    "${APP_DIR}"
+# Sign Sparkle's helpers inside-out (not --deep, which would give them the app's entitlements).
+SPARKLE="${APP_DIR}/Contents/Frameworks/Sparkle.framework"
+sign() { codesign --force --sign "${IDENTITY}" --options runtime --timestamp "$@"; }
+sign "${SPARKLE}/Versions/B/XPCServices/Installer.xpc"
+sign --preserve-metadata=entitlements "${SPARKLE}/Versions/B/XPCServices/Downloader.xpc"
+sign "${SPARKLE}/Versions/B/Autoupdate"
+sign "${SPARKLE}/Versions/B/Updater.app"
+sign "${SPARKLE}"
+
+sign --entitlements "${ENTITLEMENTS}" "${APP_DIR}"
 
 codesign --verify --deep --strict "${APP_DIR}"
 echo "Signature OK"
@@ -141,6 +161,28 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo ""
     echo "=== Stapling ==="
     xcrun stapler staple "${DMG_NAME}"
+
+    # Update feed: built from the slim DMG only, after stapling (it signs the final file).
+    if [ "${BUNDLE_MODEL}" != "yes" ]; then
+        echo ""
+        echo "=== Creating update feed (appcast.xml) ==="
+        FEED_URL=$(/usr/libexec/PlistBuddy -c "Print :SUFeedURL" "${INFO_PLIST}")
+        REPO_URL="${FEED_URL%/releases/latest/download/*}"
+        FEED_DIR=$(mktemp -d)
+        cp "${DMG_NAME}" "${FEED_DIR}/"
+        "${SPARKLE_BIN}/generate_appcast" --account "${SPARKLE_ACCOUNT}" \
+            --download-url-prefix "${REPO_URL}/releases/download/v${VERSION}/" \
+            --link "${REPO_URL}/releases" \
+            --full-release-notes-url "${REPO_URL}/releases/tag/v${VERSION}" \
+            -o appcast.xml "${FEED_DIR}"
+        rm -rf "${FEED_DIR}"
+        # generate_appcast only warns on a key mismatch, and installed apps reject such a feed.
+        if ! grep -q 'sparkle:edSignature=' appcast.xml; then
+            echo "ERROR: appcast.xml has no signature. The Keychain key does not match SUPublicEDKey."
+            exit 1
+        fi
+        echo "Feed: $(pwd)/appcast.xml (upload it with ${DMG_NAME})"
+    fi
 fi
 
 echo ""

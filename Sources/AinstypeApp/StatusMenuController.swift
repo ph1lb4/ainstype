@@ -19,6 +19,8 @@ class StatusMenuController {
     private var statusMenuItem: NSMenuItem!
     private var startAtLoginItem: NSMenuItem!
     private var liveTranscriptionItem: NSMenuItem!
+    private var updateItem: NSMenuItem!
+    private let updater = Updater()
     private var dictionaryWindowController: DictionaryWindowController?
     private var setupWindowController: SetupWindowController?
     private var hotkeyMonitor: HotkeyMonitor?
@@ -101,6 +103,12 @@ class StatusMenuController {
         permItem.target = self
         menu.addItem(permItem)
 
+        // Updates (hidden in builds without a Sparkle feed, e.g. `swift run`)
+        updateItem = NSMenuItem(title: "Check for Updates\u{2026}", action: #selector(checkForUpdates), keyEquivalent: "")
+        updateItem.target = self
+        updateItem.isHidden = !updater.isEnabled
+        menu.addItem(updateItem)
+
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
@@ -108,6 +116,18 @@ class StatusMenuController {
         menu.addItem(quitItem)
 
         statusItem.menu = menu
+
+        updater.isBusy = { [weak self] in
+            guard let self else { return false }
+            switch self.currentState {
+            case .recording, .processing: return true
+            default: return false
+            }
+        }
+        updater.onWaitingUpdateChange = { [weak self] version in
+            self?.updateItem.title = version.map { "Install Update \($0)\u{2026}" } ?? "Check for Updates\u{2026}"
+        }
+        updater.start()
 
         // Create recorder
         recorder = AudioRecorder(sampleRate: config.recording.sampleRate)
@@ -611,6 +631,10 @@ class StatusMenuController {
         alert.informativeText = lines.joined(separator: "\n")
         alert.addButton(withTitle: "OK")
         alert.runModal()
+    }
+
+    @objc private func checkForUpdates() {
+        updater.checkForUpdates()
     }
 
     @objc private func quit() {

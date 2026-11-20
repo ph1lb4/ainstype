@@ -23,9 +23,11 @@ Hold **Right Cmd** and speak. Release to transcribe and paste.
 
 The DMG bundles the WhisperKit model, so there's no first-run download.
 
+After that, ainstype keeps itself up to date. It checks once a day and you can check by hand with **Check for Updates…** in the menu. Versions up to 0.8.0 have no updater, so install 0.9.0 by hand one more time.
+
 ## Privacy
 
-Everything runs on-device. Audio is transcribed locally with WhisperKit and never leaves your Mac. The only network request the app makes is the one-time WhisperKit model download on first launch (or you can bundle the model so there's no download at all).
+Everything runs on-device. Audio is transcribed locally with WhisperKit and never leaves your Mac. The only network requests the app makes are the one-time WhisperKit model download on first launch (or you can bundle the model so there's no download at all) and the daily update check against this repo's GitHub releases.
 
 ## Model
 
@@ -57,6 +59,27 @@ On first launch, the app downloads the WhisperKit model (about 600 MB) unless on
 ```
 
 This builds a signed `.app` bundle and creates a DMG. Optionally bundles the WhisperKit model so users skip the first-run download.
+
+### Updates
+
+The app updates itself with [Sparkle](https://sparkle-project.org). It reads `appcast.xml` from the latest GitHub release and only installs updates signed with the private key that matches `SUPublicEDKey` in `Info.plist`. Builds without that key (like `swift run`) have no updater.
+
+Updates download the slim DMG (`ainstype-x.y.z-no-model.dmg`). A bundled model is copied out of the app on first launch (to `~/Library/Application Support/ainstype/Models`, an instant clone on APFS), so updating to the slim build keeps it.
+
+One-time setup:
+
+1. `swift package resolve`, so the Sparkle tools exist in `.build/artifacts/sparkle/Sparkle/bin`.
+2. `generate_keys --account ainstype` stores the private key in your login Keychain and prints the public key. Put it into `SUPublicEDKey`.
+3. Back up the key: `generate_keys --account ainstype -x ainstype_sparkle_key`, store the file in a password manager, then delete it. Without it you can't ship updates to installed apps.
+
+For each release:
+
+1. Raise `VERSION` in `build_app.sh` and `CFBundleShortVersionString` plus `CFBundleVersion` in `Info.plist`. Sparkle compares `CFBundleVersion`, so it must go up every time.
+2. `BUNDLE_MODEL=no ./build_app.sh` and notarize. This also writes `appcast.xml`, signed for that exact DMG.
+3. `BUNDLE_MODEL=yes ./build_app.sh` for the bundled DMG.
+4. Upload both DMGs and `appcast.xml` to the GitHub release `v<version>`. It must be the latest release (not a pre-release), because the app reads `releases/latest/download/appcast.xml`.
+
+From a fork, change `SUFeedURL` to your repo and use your own key (`SPARKLE_ACCOUNT` picks the Keychain account).
 
 ## Configuration
 

@@ -45,10 +45,25 @@ class Pipeline {
             let modelPath: String
             let cached = ModelState.load(expectedModel: model)
 
-            // Resolve model path: bundled > cached > download
-            if let bundled = bundledModelPath {
-                modelPath = bundled
-                log("Using bundled model at \(modelPath)")
+            var aneSpecialized = cached?.aneSpecialized == true
+            let bundlePath = Bundle.main.bundlePath + "/"
+
+            // Resolve model path: cached outside the app > bundled (copied out) > download.
+            // A bundled model is copied out of the app once, so an auto-update to the
+            // slim build (no model inside) keeps working without a new download.
+            if let cached, !cached.modelPath.hasPrefix(bundlePath) {
+                modelPath = cached.modelPath
+                log("Using cached model at \(modelPath)")
+            } else if let bundled = bundledModelPath {
+                if let copied = await Self.copyModelOutOfBundle(bundled, model: model) {
+                    modelPath = copied
+                    aneSpecialized = false
+                    ModelState.save(modelPath: modelPath, model: model, aneSpecialized: false)
+                    log("Copied bundled model to \(modelPath)")
+                } else {
+                    modelPath = bundled
+                    log("Using bundled model at \(modelPath)")
+                }
             } else if let cached {
                 modelPath = cached.modelPath
                 log("Using cached model at \(modelPath)")
@@ -99,7 +114,7 @@ class Pipeline {
             // Phase 2: upgrade to ANE in the background. First-time ANE specialization is
             // expensive but cached by CoreML in ~/Library/Caches/com.apple.e5rt.e5bundlecache;
             // subsequent launches just reuse the cached compilation.
-            let needsSpecialization = cached?.aneSpecialized != true
+            let needsSpecialization = !aneSpecialized
             Task.detached(priority: .utility) { [weak self] in
                 await self?.upgradeToANE(modelPath: modelPath, isFirstTime: needsSpecialization)
             }
@@ -107,6 +122,31 @@ class Pipeline {
             log("ERROR: Failed to initialize WhisperKit: \(error)")
             status("error")
         }
+    }
+
+    /// Copies a bundled model to ~/Library/Application Support/ainstype/Models.
+    /// On APFS this is a clone, so it is instant and takes no extra space.
+    /// Returns nil on failure, so the caller falls back to the bundled copy.
+    private static func copyModelOutOfBundle(_ source: String, model: String) async -> String? {
+        await Task.detached(priority: .userInitiated) { () -> String? in
+            let fm = FileManager.default
+            guard let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+            let modelsDir = support.appendingPathComponent("ainstype/Models", isDirectory: true)
+            let dest = modelsDir.appendingPathComponent(model, isDirectory: true)
+            let temp = modelsDir.appendingPathComponent(".\(model).partial", isDirectory: true)
+            do {
+                try fm.createDirectory(at: modelsDir, withIntermediateDirectories: true)
+                try? fm.removeItem(at: temp)
+                try fm.copyItem(at: URL(fileURLWithPath: source), to: temp)
+                try? fm.removeItem(at: dest)
+                try fm.moveItem(at: temp, to: dest)
+                return dest.path
+            } catch {
+                try? fm.removeItem(at: temp)
+                Logger.log("Could not copy bundled model out of the app: \(error)")
+                return nil
+            }
+        }.value
     }
 
     /// Fail the download if no progress is reported for this long (stalled connection).
