@@ -382,7 +382,9 @@ enum Clipboard {
     /// selection) in the focused editable accessibility element.
     private static func insertIntoFocusedElement(_ text: String) -> Bool {
         guard let focused = FocusSnapshot.focusedElement(),
-              !FocusSnapshot.isInWebContent(focused) else { return false }
+              !FocusSnapshot.isInWebContent(focused),
+              !ignoresSelectedTextWrites(focused)
+        else { return false }
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(
             focused,
@@ -397,6 +399,19 @@ enum Clipboard {
             kAXSelectedTextAttribute as CFString,
             text as CFString
         ) == .success
+    }
+
+    /// JetBrains IDEs accept the write but put it into the terminal's screen
+    /// buffer instead of the shell, so the text lands on the wrong line.
+    static func isUnreliableInsertTarget(bundleID: String?) -> Bool {
+        guard let bundleID else { return false }
+        return bundleID.hasPrefix("com.jetbrains.") || bundleID == "com.google.android.studio"
+    }
+
+    private static func ignoresSelectedTextWrites(_ element: AXUIElement) -> Bool {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success else { return false }
+        return isUnreliableInsertTarget(bundleID: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier)
     }
 
     static let insertFailedNote = "Nothing was focused that accepts text. Click Copy, then press \u{2318}V in a text field."
